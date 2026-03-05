@@ -1,139 +1,165 @@
-# Flux2 Layer Activation Delta Analysis
+# FLUX.2-Klein Layer Redundancy Workflow
 
-This repository contains local Flux2 model files plus a utility script to measure how much each transformer layer changes activations across denoising timesteps.
+This repository provides an end-to-end workflow to:
+1. Run `FLUX.2-klein-4B` through the full text-to-image pipeline on a large prompt set.
+1. Collect per-layer activation deltas across denoising timesteps.
+1. Rank transformer layers by a redundancy heuristic to suggest pruning order.
 
-The main analysis entrypoint is:
-- `analyze_flux2_activations.py`
+## Repository Files
 
-It uses:
-- `transformer_flux2.py` (local `Flux2Transformer2DModel`)
-- `flux2_klein_transformer_config.json` (model architecture config)
+- `analyze_flux2_activations.py`: Pipeline-based activation collection.
+- `rank_flux2_redundant_layers.py`: Redundancy ranking from generated CSV files.
+- `flux2_klein_prompts_100.json`: Prompt set file (currently contains 500 prompts).
+- `pipeline_flux2.py`: Local FLUX2 pipeline source.
+- `transformer_flux2.py`: Local FLUX2 transformer source.
 
-## What This Analysis Measures
+## Unified Workflow
 
-For each timestep and for each transformer layer, the script computes:
+### Step 0: Environment
 
-- `mean(abs(output - input))` for `hidden_states` (image stream)
-- `mean(abs(output - input))` for `encoder_hidden_states` (text stream)
+Install dependencies:
 
-This is done separately for:
-- Double-stream blocks (`transformer_blocks`)
-- Single-stream blocks (`single_transformer_blocks`) by splitting concatenated text/image tokens
+```bash
+pip install torch matplotlib diffusers transformers accelerate
+```
 
-So for every layer you get a curve over timesteps showing how strongly that layer updates each stream.
+Recommended:
+- CUDA GPU
+- `torch.bfloat16` or `torch.float16`
 
-## Detailed Flow
+### Step 1: Run Pipeline Activation Analysis
 
-1. Load model config from `flux2_klein_transformer_config.json`.
-1. Build `Flux2Transformer2DModel` from the config.
-1. Generate or parse raw timesteps (for example `1000 -> 1`).
-1. Convert raw timesteps to normalized values expected by the model (`t / 1000`).
-1. Create synthetic input tensors:
-   - `hidden_states`: shape `[batch, image_seq_len, in_channels]`
-   - `encoder_hidden_states`: shape `[batch, text_seq_len, joint_attention_dim]`
-   - `img_ids` and `txt_ids` for RoPE positions
-1. Register forward hooks on each layer:
-   - `double_XX` for each double-stream block
-   - `single_XX` for each single-stream block
-1. For each timestep, run one model forward pass.
-1. Inside hooks, compute:
-   - `abs_delta_hidden = mean(abs(hidden_out - hidden_in))`
-   - `abs_delta_encoder = mean(abs(encoder_out - encoder_in))`
-1. Save results to:
-   - CSV table
-   - Per-layer line plots
-   - Combined all-layer plots for each stream
+This step uses real pipeline inference (not synthetic direct-transformer calls).
+
+Core behavior:
+- Loads `Flux2KleinPipeline` from `black-forest-labs/FLUX.2-klein-4B`.
+- Runs prompts one by one.
+- Hooks:
+  - `pipe.transformer.transformer_blocks` (`double_XX`)
+  - `pipe.transformer.single_transformer_blocks` (`single_XX`)
+- At each denoising step, records:
+  - `mean(abs(hidden_out - hidden_in))`
+  - `mean(abs(encoder_out - encoder_in))`
+- Aggregates by `(layer, raw_timestep)` across prompts.
+
+Run command:
+
+```bash
+python analyze_flux2_activations.py \
+  --model-id black-forest-labs/FLUX.2-klein-4B \
+  --prompts-file flux2_klein_prompts_100.json \
+  --output-dir activation_plots \
+  --num-inference-steps 4 \
+  --height 1024 \
+  --width 1024 \
+  --guidance-scale 1.0 \
+  --dtype bfloat16
+```
+
+Optional:
+- Save generated images:
+
+```bash
+python analyze_flux2_activations.py \
+  --prompts-file flux2_klein_prompts_100.json \
+  --save-images \
+  --save-images-limit 500
+```
+
+Performance note:
+- If `--save-images` is not set, the script uses `output_type="latent"` to skip VAE decode for faster profiling.
+
+### Step 2: Rank Redundant Layers
+
+This step reads activation CSV output and produces a removal order heuristic.
+
+Default ranking command:
+
+```bash
+python rank_flux2_redundant_layers.py \
+  --csv activation_plots/layer_activation_deltas_pipeline.csv \
+  --output-dir activation_plots/redundancy_report \
+  --top-k 20
+```
+
+Aggregate across multiple CSV runs:
+
+```bash
+python rank_flux2_redundant_layers.py \
+  --csv-glob "activation_plots/**/layer_activation_deltas_pipeline.csv" \
+  --output-dir activation_plots/redundancy_report_multi \
+  --top-k 30
+```
+
+Protect specific/final layers:
+
+```bash
+python rank_flux2_redundant_layers.py \
+  --csv activation_plots/layer_activation_deltas_pipeline.csv \
+  --protect-final-double 1 \
+  --protect-final-single 2 \
+  --protect-layers "double_04,single_19"
+```
+
+### Step 3: Validate Pruning Decisions
+
+Use ranking output as candidate order only. Then validate by:
+- Removing candidate layers incrementally.
+- Re-running generation on held-out prompts.
+- Measuring visual quality and latency trade-off.
 
 ## Outputs
 
-By default, outputs are written to `activation_plots/`.
+### From `analyze_flux2_activations.py`
 
-- `layer_activation_deltas.csv`
-  - Columns:
-    - `layer`
-    - `raw_timestep`
-    - `hidden_states_abs_delta_mean`
-    - `encoder_hidden_states_abs_delta_mean`
-- `double_XX_abs_delta.png` and `single_XX_abs_delta.png`
-  - One figure per layer with two lines (`hidden_states`, `encoder_hidden_states`)
-- `all_layers_hidden_states.png`
-  - All layers on one figure for hidden stream
-- `all_layers_encoder_hidden_states.png`
-  - All layers on one figure for encoder stream
+- `activation_plots/layer_activation_deltas_pipeline.csv`
+- `activation_plots/double_XX_abs_delta_pipeline.png`
+- `activation_plots/single_XX_abs_delta_pipeline.png`
+- `activation_plots/all_layers_hidden_states_pipeline.png`
+- `activation_plots/all_layers_encoder_hidden_states_pipeline.png`
+- `activation_plots/run_metadata.json`
+- `activation_plots/generated_images/prompt_XXX.png` (if `--save-images`)
 
-## Setup
+### From `rank_flux2_redundant_layers.py`
 
-Use a Python environment with at least:
+- `activation_plots/redundancy_report/layer_redundancy_ranking.csv`
+- `activation_plots/redundancy_report/suggested_removal_order.txt`
+- `activation_plots/redundancy_report/redundancy_metadata.json`
 
-- `torch`
-- `matplotlib`
-- `diffusers`
-- `transformers`
+## Scoring Logic for Redundancy
 
-Example install command:
+Per layer, the ranking script computes:
+- `combined_mean_delta`
+- `combined_peak_delta`
+- `combined_std_delta`
 
-```bash
-pip install torch matplotlib diffusers transformers
-```
+Then:
+- Min-max normalize each metric across layers.
+- Compute:
+  - `importance_score = 0.6*mean + 0.3*peak + 0.1*std` (defaults)
+- Compute:
+  - `redundancy_score = 1 - importance_score`
 
-## Run Instructions
+Higher `redundancy_score` means earlier suggestion for removal.
 
-### 1) Default run (20 timesteps from 1000 to 1)
+## Prompt Set Note
 
-```bash
-python analyze_flux2_activations.py \
-  --config flux2_klein_transformer_config.json \
-  --output-dir activation_plots \
-  --num-timesteps 20 \
-  --timestep-start 1000 \
-  --timestep-end 1
-```
+`flux2_klein_prompts_100.json` is kept as filename for backward compatibility, but the file now contains **500** prompts.
 
-### 2) Explicit custom timesteps
+## What I Could Not Execute in This Sandbox
 
-```bash
-python analyze_flux2_activations.py \
-  --config flux2_klein_transformer_config.json \
-  --timesteps "1000,900,800,700,600,500,400,300,200,100,1"
-```
+The code and scripts were implemented and wired together, but the following could not be executed in this Codex sandbox session:
 
-### 3) Control sequence lengths, batch, and device
+- Python runtime execution (`python` launcher not runnable in this shell context).
+- Full FLUX.2-klein inference runs (requires working Python + model download + GPU runtime).
+- End-to-end generation of activation CSV/plots from this environment.
+- Empirical verification of ranked layer removals on output quality.
 
-```bash
-python analyze_flux2_activations.py \
-  --config flux2_klein_transformer_config.json \
-  --image-seq-len 64 \
-  --text-seq-len 64 \
-  --batch-size 2 \
-  --device cuda \
-  --output-dir activation_plots_b2
-```
+Because of that, run the commands above in your local training/inference environment to generate real outputs and validate pruning decisions.
 
-## CLI Arguments
+## Recommended Execution Order (Local)
 
-- `--config`: path to model config JSON
-- `--output-dir`: directory for CSV and plots
-- `--timesteps`: comma-separated raw timesteps; overrides generated schedule
-- `--timestep-start`: start raw timestep for generated schedule
-- `--timestep-end`: end raw timestep for generated schedule
-- `--num-timesteps`: number of points in generated schedule
-- `--batch-size`: synthetic batch size
-- `--image-seq-len`: image token count
-- `--text-seq-len`: text token count
-- `--seed`: RNG seed
-- `--device`: device override (`cpu` or `cuda`)
-
-## Notes and Interpretation
-
-- The script measures internal layer update magnitude, not final image quality.
-- Inputs are synthetic random tensors by default; this is useful for structural/profiling comparisons.
-- For data-dependent behavior, replace synthetic tensors with real latents/text embeddings from your pipeline and keep the same hook logic.
-- Higher `mean(abs(output - input))` means that layer is making a stronger update at that timestep.
-- Comparing `hidden_states` vs `encoder_hidden_states` shows whether image stream or text stream is being changed more strongly over time.
-
-## Related Files
-
-- `transformer_flux2.py`
-- `pipeline_flux2.py`
-- `flux2_klein_transformer_config.json`
-- `analyze_flux2_activations.py`
+1. Run `analyze_flux2_activations.py` on all 500 prompts.
+1. Inspect activation plots for obvious low-impact layers.
+1. Run `rank_flux2_redundant_layers.py` to get removal order.
+1. Prune in small batches and validate image quality and speed.
