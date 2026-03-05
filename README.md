@@ -1,9 +1,17 @@
-# FLUX.2-Klein Layer Redundancy Workflow
+# FLUX.2-Klein Pruning Workflow
 
-This repository provides an end-to-end workflow to:
-1. Run `FLUX.2-klein-4B` through the full text-to-image pipeline on a large prompt set.
-1. Collect per-layer activation deltas across denoising timesteps.
-1. Rank transformer layers by a redundancy heuristic to suggest pruning order.
+This GitHub repo covers three pruning tasks for `FLUX.2-klein-4B`:
+1. Transformer layer pruning
+2. MLP channel pruning
+3. Attention head pruning
+
+## Pruning TODO
+
+- [x] Transformer layer pruning: remove low-impact transformer blocks (double/single stream) using timestep-aware activation-delta ranking.
+- [ ] MLP channel pruning: remove low-importance feed-forward channels inside transformer blocks to shrink MLP width with minimal quality loss.
+- [ ] Attention head pruning: remove low-importance attention heads to reduce attention compute and memory while preserving generation quality.
+
+The implemented workflow in this repository currently focuses on transformer layer pruning end-to-end.
 
 ## Repository Files
 
@@ -160,6 +168,6 @@ Because of that, run the commands above in your local training/inference environ
 ## Recommended Execution Order (Local)
 
 1. Run `analyze_flux2_activations.py` on all 500 prompts.
-1. Inspect activation plots for obvious low-impact layers.
-1. Run `rank_flux2_redundant_layers.py` to get removal order.
-1. Prune in small batches and validate image quality and speed.
+2. Inspect activation plots for obvious low-impact layers.
+3. Run `rank_flux2_redundant_layers.py` to get removal order.
+4. Prune in small batches and validate image quality and speed.
