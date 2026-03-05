@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompts-file",
         type=Path,
-        default=Path("flux2_klein_prompts_100.json"),
+        default=Path("flux2_klein_prompts.json"),
         help="JSON file containing a list of prompts or {'prompts': [...]}",
     )
     parser.add_argument(

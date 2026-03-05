@@ -9,7 +9,7 @@ This repository provides an end-to-end workflow to:
 
 - `analyze_flux2_activations.py`: Pipeline-based activation collection.
 - `rank_flux2_redundant_layers.py`: Redundancy ranking from generated CSV files.
-- `flux2_klein_prompts_100.json`: Prompt set file (currently contains 500 prompts).
+- `flux2_klein_prompts.json`: Prompt set file (currently contains 500 prompts).
 - `pipeline_flux2.py`: Local FLUX2 pipeline source.
 - `transformer_flux2.py`: Local FLUX2 transformer source.
 
@@ -47,7 +47,7 @@ Run command:
 ```bash
 python analyze_flux2_activations.py \
   --model-id black-forest-labs/FLUX.2-klein-4B \
-  --prompts-file flux2_klein_prompts_100.json \
+  --prompts-file flux2_klein_prompts.json \
   --output-dir activation_plots \
   --num-inference-steps 4 \
   --height 1024 \
@@ -61,7 +61,7 @@ Optional:
 
 ```bash
 python analyze_flux2_activations.py \
-  --prompts-file flux2_klein_prompts_100.json \
+  --prompts-file flux2_klein_prompts.json \
   --save-images \
   --save-images-limit 500
 ```
@@ -144,7 +144,7 @@ Higher `redundancy_score` means earlier suggestion for removal.
 
 ## Prompt Set Note
 
-`flux2_klein_prompts_100.json` is kept as filename for backward compatibility, but the file now contains **500** prompts.
+`flux2_klein_prompts.json` contains **500** prompts.
 
 ## What I Could Not Execute in This Sandbox
 
