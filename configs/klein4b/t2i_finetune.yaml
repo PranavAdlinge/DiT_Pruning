@@ -1,0 +1,71 @@
+# Klein 4B t2i fine-tune — SSTK training. latent_channels, text_embed_hidden from base.
+extends: base.yaml
+
+dataset:
+  class_name: nexus.data.precomputed_sstk_dataset:PrecomputedSSTKDataset
+  kwargs:
+    local: null
+    resolution: 512
+    shuffle: true
+
+collate:
+  class_name: nexus.data.precomputed_sstk_dataset:collate_precomputed
+
+model:
+  dit:
+    class_name: diffusers:Flux2Transformer2DModel
+    subfolder: transformer
+
+train_mode: lora
+
+lora:
+  rank: 4
+  alpha: 4
+  dropout: 0.0
+  target_modules: ["to_k", "to_q", "to_v", "to_out.0"]
+
+train:
+  batch_size: 4
+  max_steps: 1000
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: false
+  learning_rate: 1.0e-4
+  guidance_scale: 3.5
+  scale_lr: false
+  lr_scheduler: constant
+  lr_warmup_steps: 500
+  lr_num_cycles: 1
+  lr_power: 1.0
+  dataloader_num_workers: 0
+
+loss:
+  class_name: nexus.losses:FlowMatchingLoss
+  weighting_scheme: none
+  logit_mean: 0.0
+  logit_std: 1.0
+  kwargs:
+    base: mse
+
+optimizer:
+  class_name: torch.optim:AdamW
+  kwargs:
+    betas: [0.9, 0.999]
+    weight_decay: 0.0001
+    eps: 1.0e-8
+max_grad_norm: 1.0
+
+validation:
+  steps: 500
+  prompt: null
+  seed: 42
+
+checkpointing_steps: 500
+resume_from_checkpoint: null
+seed: null
+
+allow_tf32: false
+
+mlflow:
+  experiment_name: klein4b-t2i-finetune
+  run_name: batch4-lora4
+  user: null

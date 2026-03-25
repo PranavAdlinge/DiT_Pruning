@@ -1,0 +1,23 @@
+# Base Flux2 Klein 4B — FLUX.2-klein-base-4B (undistilled foundation model).
+# Child configs inherit; latent_channels and text_embed_hidden injected into dataset.kwargs.
+# log_root: project-level logs dir; mlruns at log_root/mlruns, runs at log_root/experiments/{user}/{exp}-{run}
+
+log_root: logs
+mixed_precision: bf16
+
+pipeline:
+  class_name: diffusers:Flux2KleinPipeline
+  pretrained_model_name_or_path: black-forest-labs/FLUX.2-klein-base-4B
+
+latent_channels: 32
+text_embed_hidden: 7680  # 2560*3 for Flux.2 Klein
+
+validation:
+  num_images: 2
+  inference_steps: 4
+  guidance_scale: 1.0
+
+report_to: mlflow
+mlflow:
+  tracking_uri: null
+  user: null

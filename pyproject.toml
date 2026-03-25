@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexus"
+version = "0.1.0"
+description = "Config-driven Flux.2 Klein training on precomputed SSTK data"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ftfy",
+    "beautifulsoup4",
+    "torch>=2.0",
+    "diffusers>=0.36.0",
+    "transformers>=4.41.2",
+    "accelerate>=0.31.0",
+    "peft>=0.11.1",
+    "huggingface_hub",
+    "mlflow>=2.0",
+    "mosaicml-streaming",
+    "pyyaml",
+    "safetensors",
+    "pytest",
+    "ruff>=0.4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as integration (slow, require GPU/model)",
+]
+testpaths = ["tests", "datasets/prepare/sstk/tests", "datasets/prepare/dreambooth/tests", "datasets/tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests", "datasets"]
+exclude = []
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "F",      # pyflakes
+    "I",      # isort
+    "B",      # bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "ARG",    # unused args
+    "SIM",    # simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG", "S101"]  # assert ok in tests
+"datasets/prepare/**" = ["ARG"]
+"src/nexus/losses/**" = ["ARG002"]  # **kwargs required by base class interface
+
+[tool.ruff.format]
+quote-style = "double"
