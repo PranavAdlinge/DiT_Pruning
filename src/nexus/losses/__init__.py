@@ -9,6 +9,7 @@ Configure in YAML via loss.class_name and loss.kwargs.
 from nexus.train.config import ns_to_kwargs
 
 from .context import LossContext
+from .depth_distillation import PruningDepthDistillationLoss
 from .distillation import DistillationLoss
 from .flow_matching import BASE_LOSSES, FlowMatchingLoss
 from .prior_preservation import FlowMatchingWithPriorPreservation
@@ -34,6 +35,7 @@ __all__ = [
     "FlowMatchingLoss",
     "FlowMatchingWithPriorPreservation",
     "DistillationLoss",
+    "PruningDepthDistillationLoss",
     "BASE_LOSSES",
     "build_loss_fn",
 ]

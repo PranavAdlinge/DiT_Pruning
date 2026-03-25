@@ -120,6 +120,7 @@ python datasets/precompute.py \
 | `FlowMatchingLoss` | Default. MSE/L1/Huber/LogCosh, optional weighting. |
 | `FlowMatchingWithPriorPreservation` | DreamBooth instance + class |
 | `DistillationLoss` | Flow + distillation from frozen teacher |
+| `PruningDepthDistillationLoss` | Non-sequential interval depth distillation for pruned double/single Flux.2 blocks |
 
 Config example:
 
@@ -129,6 +130,17 @@ loss:
   weighting_scheme: none
   kwargs:
     base: mse
+```
+
+Pruning-depth example:
+
+```yaml
+loss:
+  class_name: nexus.losses:PruningDepthDistillationLoss
+  weighting_scheme: none
+  kwargs:
+    pretrained_model_name_or_path: black-forest-labs/FLUX.2-klein-base-4B
+    pruned_blocks: ["d0", "d1", "d2", "s0", "s1"]
 ```
 
 ---
