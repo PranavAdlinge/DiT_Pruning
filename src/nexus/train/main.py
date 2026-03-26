@@ -88,6 +88,28 @@ def _collect_trainable_params(*modules: nn.Module) -> list[torch.nn.Parameter]:
     return params
 
 
+def _make_skip_transformer_checkpoint_hooks(trans_cls: type, unwrap_fn):
+    """Skip saving/loading the frozen base transformer for loss-managed training."""
+
+    def save_hook(models, weights, output_dir):
+        trans_idx = next(
+            (idx for idx, model in enumerate(models) if isinstance(unwrap_fn(model), trans_cls)),
+            None,
+        )
+        if trans_idx is not None and weights and trans_idx < len(weights):
+            weights.pop(trans_idx)
+
+    def load_hook(models, input_dir):
+        trans_idx = next(
+            (idx for idx, model in enumerate(models) if isinstance(unwrap_fn(model), trans_cls)),
+            None,
+        )
+        if trans_idx is not None:
+            models.pop(trans_idx)
+
+    return save_hook, load_hook
+
+
 def main(args=None):
     """Run Flux.2 Klein LoRA/full training on precomputed SSTK data."""
     cfg = parse_args(args)
@@ -207,7 +229,7 @@ def main(args=None):
         loss_fn.prepare_for_training(transformer)
 
     train_base_model = bool(_get_obj_attr(loss_fn, "train_base_model", True))
-    checkpoint_train_mode = train_mode if train_base_model else "full"
+    checkpoint_train_mode = train_mode if train_base_model else None
     lora_config = None
     if train_base_model and train_mode == "lora" and lora_cfg:
         target_modules = (
@@ -241,25 +263,28 @@ def main(args=None):
     is_fsdp = getattr(accelerator.state, "fsdp_plugin", None) is not None
     unwrap = lambda m: unwrap_model(accelerator, m)
 
-    save_hook = make_klein_save_hook(
-        accelerator=accelerator,
-        trans_cls=trans_cls,
-        train_mode=checkpoint_train_mode,
-        pipeline_cls=pipeline_cls,
-        unwrap_fn=unwrap,
-        is_fsdp=is_fsdp,
-    )
-    load_hook = make_klein_load_hook(
-        accelerator=accelerator,
-        trans_cls=trans_cls,
-        pretrained_path=pretrained_path,
-        subfolder=subfolder,
-        train_mode=checkpoint_train_mode,
-        pipeline_cls=pipeline_cls,
-        lora_config=lora_config,
-        unwrap_fn=unwrap,
-        mixed_precision=mp,
-    )
+    if train_base_model:
+        save_hook = make_klein_save_hook(
+            accelerator=accelerator,
+            trans_cls=trans_cls,
+            train_mode=checkpoint_train_mode,
+            pipeline_cls=pipeline_cls,
+            unwrap_fn=unwrap,
+            is_fsdp=is_fsdp,
+        )
+        load_hook = make_klein_load_hook(
+            accelerator=accelerator,
+            trans_cls=trans_cls,
+            pretrained_path=pretrained_path,
+            subfolder=subfolder,
+            train_mode=checkpoint_train_mode,
+            pipeline_cls=pipeline_cls,
+            lora_config=lora_config,
+            unwrap_fn=unwrap,
+            mixed_precision=mp,
+        )
+    else:
+        save_hook, load_hook = _make_skip_transformer_checkpoint_hooks(trans_cls, unwrap)
     accelerator.register_save_state_pre_hook(save_hook)
     accelerator.register_load_state_pre_hook(load_hook)
 
@@ -398,7 +423,9 @@ def main(args=None):
         logger.info("***** Running training *****")
         logger.info("  Data = %s", ds_kwargs.get("local"))
         if not train_base_model:
-            logger.info("  Using loss-managed student blocks; base transformer remains frozen.")
+            logger.info(
+                "  Using loss-managed LoRA student blocks; base transformer remains frozen and is excluded from checkpoints."
+            )
 
     global_step = 0
     first_epoch = 0

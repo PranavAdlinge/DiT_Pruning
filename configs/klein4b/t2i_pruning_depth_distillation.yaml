@@ -18,7 +18,7 @@ model:
     class_name: diffusers:Flux2Transformer2DModel
     subfolder: transformer
 
-train_mode: full
+train_mode: lora
 
 train:
   batch_size: 4
