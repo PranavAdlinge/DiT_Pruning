@@ -40,7 +40,9 @@ loss:
   kwargs:
     pretrained_model_name_or_path: black-forest-labs/FLUX.2-klein-base-4B
     depth_weight: 1.0
-    pruned_blocks: ["d0", "d1", "d2", "s0", "s1", "s2"]
+    pruned_blocks:
+      - ["d1", "d2"]
+      - ["s2", "s4"]
 
 optimizer:
   class_name: torch.optim:AdamW

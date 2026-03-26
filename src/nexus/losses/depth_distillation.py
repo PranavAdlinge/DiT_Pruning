@@ -13,8 +13,6 @@ import copy
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
-
 import torch
 import torch.nn as nn
 
@@ -27,28 +25,6 @@ class IntervalSpec:
     start: int
     end: int
     student_index: int
-
-
-def _as_sorted_unique(indices: Iterable[int]) -> list[int]:
-    return sorted(set(int(index) for index in indices))
-
-
-def _group_contiguous(indices: list[int]) -> list[tuple[int, int]]:
-    if not indices:
-        return []
-
-    grouped: list[tuple[int, int]] = []
-    start = prev = indices[0]
-    for index in indices[1:]:
-        if index == prev + 1:
-            prev = index
-            continue
-        grouped.append((start, prev))
-        start = prev = index
-    grouped.append((start, prev))
-    return grouped
-
-
 def _parse_stream_index(value, expected_stream: str | None = None) -> tuple[str | None, int]:
     if isinstance(value, int):
         return expected_stream, int(value)
@@ -70,6 +46,34 @@ def _parse_stream_index(value, expected_stream: str | None = None) -> tuple[str 
     return stream or expected_stream, int(text)
 
 
+def _parse_interval_entry(value, expected_stream: str | None = None) -> tuple[str | None, int, int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(
+            "Pruning interval entries must be 2-item lists or tuples, "
+            f"got {value!r}."
+        )
+
+    start_stream, start = _parse_stream_index(value[0], expected_stream=expected_stream)
+    end_stream, end = _parse_stream_index(value[1], expected_stream=expected_stream)
+
+    stream = start_stream or end_stream or expected_stream
+    if stream is None:
+        raise ValueError(
+            "Pruning interval entries must include a stream prefix ('d' or 's') "
+            "when using unified `pruned_blocks`."
+        )
+    if start_stream is not None and start_stream != stream:
+        raise ValueError(f"Invalid interval start stream in {value!r}.")
+    if end_stream is not None and end_stream != stream:
+        raise ValueError(f"Invalid interval end stream in {value!r}.")
+    if start > end:
+        raise ValueError(
+            f"Pruning interval start must be <= end, got {value!r}."
+        )
+
+    return stream, start, end
+
+
 def parse_pruning_intervals(
     *,
     pruned_blocks=None,
@@ -80,9 +84,9 @@ def parse_pruning_intervals(
     Parse pruning specs into contiguous intervals.
 
     Accepted formats:
-    - `pruned_blocks: ["d0", "d1", "s3"]`
-    - `double_stream_pruned_blocks: [0, 1]`
-    - `single_stream_pruned_blocks: ["s4", "s5"]`
+    - `pruned_blocks: [["d1", "d2"], ["s2", "s4"]]`
+    - `double_stream_pruned_blocks: [[1, 2]]`
+    - `single_stream_pruned_blocks: [["s2", "s4"]]`
     """
 
     if pruned_blocks is not None and (
@@ -92,34 +96,27 @@ def parse_pruning_intervals(
             "Use either `pruned_blocks` or the per-stream pruning lists, not both."
         )
 
-    double_indices: list[int] = []
-    single_indices: list[int] = []
+    double_intervals: list[tuple[int, int]] = []
+    single_intervals: list[tuple[int, int]] = []
 
     if pruned_blocks is not None:
         for value in pruned_blocks:
-            stream, index = _parse_stream_index(value)
-            if stream is None:
-                raise ValueError(
-                    "Unified `pruned_blocks` entries must be prefixed with 'd' or 's', "
-                    f"got {value!r}."
-                )
+            stream, start, end = _parse_interval_entry(value)
             if stream == "d":
-                double_indices.append(index)
+                double_intervals.append((start, end))
             else:
-                single_indices.append(index)
+                single_intervals.append((start, end))
     else:
         if double_stream_pruned_blocks is not None:
             for value in double_stream_pruned_blocks:
-                _, index = _parse_stream_index(value, expected_stream="d")
-                double_indices.append(index)
+                _, start, end = _parse_interval_entry(value, expected_stream="d")
+                double_intervals.append((start, end))
         if single_stream_pruned_blocks is not None:
             for value in single_stream_pruned_blocks:
-                _, index = _parse_stream_index(value, expected_stream="s")
-                single_indices.append(index)
+                _, start, end = _parse_interval_entry(value, expected_stream="s")
+                single_intervals.append((start, end))
 
-    double_intervals = _group_contiguous(_as_sorted_unique(double_indices))
-    single_intervals = _group_contiguous(_as_sorted_unique(single_indices))
-    return double_intervals, single_intervals
+    return sorted(set(double_intervals)), sorted(set(single_intervals))
 
 
 def _l2_normalize(x: torch.Tensor, eps: float) -> torch.Tensor:
