@@ -2,9 +2,10 @@
 Non-sequential depth distillation for pruned Flux.2 transformer intervals.
 
 This loss trains standalone student blocks cloned from the first block of each
-pruned interval and matches them against the frozen teacher representation at
-the end of the interval, following the interval-wise formulation described by
-the user.
+pruned interval, with trainable LoRA adapters attached to those cloned blocks.
+The student output is matched against the frozen teacher representation at the
+end of the interval, following the interval-wise formulation described by the
+user.
 """
 
 from __future__ import annotations
@@ -13,8 +14,11 @@ import copy
 import json
 from dataclasses import dataclass
 from pathlib import Path
+
 import torch
 import torch.nn as nn
+from peft import LoraConfig, get_peft_model
+from peft.utils import get_peft_model_state_dict
 
 from .context import LossContext
 
@@ -25,6 +29,8 @@ class IntervalSpec:
     start: int
     end: int
     student_index: int
+
+
 def _parse_stream_index(value, expected_stream: str | None = None) -> tuple[str | None, int]:
     if isinstance(value, int):
         return expected_stream, int(value)
@@ -134,14 +140,51 @@ def _module_device(module: nn.Module) -> torch.device:
     return next(module.parameters()).device
 
 
+def _find_lora_target_modules(module: nn.Module) -> list[str]:
+    target_modules: list[str] = []
+    for name, child in module.named_modules():
+        if not name:
+            continue
+        if isinstance(child, (nn.Linear, nn.Embedding, nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+            target_modules.append(name)
+    if not target_modules:
+        raise ValueError(
+            f"Could not find any LoRA-compatible submodules inside {module.__class__.__name__}."
+        )
+    return sorted(set(target_modules))
+
+
+def make_lora_student_block(
+    block: nn.Module,
+    *,
+    rank: int = 128,
+    alpha: int | None = None,
+    dropout: float = 0.0,
+    target_modules: list[str] | None = None,
+) -> nn.Module:
+    target_modules = (
+        sorted(set(target_modules))
+        if target_modules is not None
+        else _find_lora_target_modules(block)
+    )
+    lora_config = LoraConfig(
+        r=rank,
+        lora_alpha=rank if alpha is None else alpha,
+        lora_dropout=dropout,
+        init_lora_weights="gaussian",
+        target_modules=target_modules,
+    )
+    return get_peft_model(block, lora_config)
+
+
 class PruningDepthDistillationLoss(nn.Module):
     """
     Interval-wise depth distillation for Flux.2 pruning.
 
-    The student consists of standalone trainable blocks cloned from the first
-    block of each pruned interval. Each student block receives the frozen
-    teacher input at the start of the interval and matches the teacher output at
-    the end of the interval.
+    The student consists of frozen cloned blocks with trainable LoRA adapters
+    attached to the first block of each pruned interval. Each student block
+    receives the frozen teacher input at the start of the interval and matches
+    the teacher output at the end of the interval.
     """
 
     manages_model_forward = True
@@ -155,6 +198,10 @@ class PruningDepthDistillationLoss(nn.Module):
         pruned_blocks=None,
         double_stream_pruned_blocks=None,
         single_stream_pruned_blocks=None,
+        lora_rank: int = 128,
+        lora_alpha: int | None = None,
+        lora_dropout: float = 0.0,
+        lora_target_modules: list[str] | None = None,
         depth_weight: float = 1.0,
         normalize_eps: float = 1.0e-6,
         transformer_cls: type | None = None,
@@ -172,6 +219,10 @@ class PruningDepthDistillationLoss(nn.Module):
         self.teacher_path = pretrained_model_name_or_path
         self.depth_weight = depth_weight
         self.normalize_eps = normalize_eps
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_rank if lora_alpha is None else lora_alpha
+        self.lora_dropout = lora_dropout
+        self.lora_target_modules = lora_target_modules
 
         self.double_intervals, self.single_intervals = parse_pruning_intervals(
             pruned_blocks=pruned_blocks,
@@ -237,7 +288,14 @@ class PruningDepthDistillationLoss(nn.Module):
                     f"Double-stream pruning interval [{start}, {end}] is outside "
                     f"the available range [0, {total_double - 1}]."
                 )
-            self.student_double_blocks.append(copy.deepcopy(transformer.transformer_blocks[start]))
+            student_block = make_lora_student_block(
+                copy.deepcopy(transformer.transformer_blocks[start]),
+                rank=self.lora_rank,
+                alpha=self.lora_alpha,
+                dropout=self.lora_dropout,
+                target_modules=self.lora_target_modules,
+            )
+            self.student_double_blocks.append(student_block)
             self.double_interval_specs.append(
                 IntervalSpec(stream="double", start=start, end=end, student_index=idx)
             )
@@ -253,7 +311,14 @@ class PruningDepthDistillationLoss(nn.Module):
                     f"Single-stream pruning interval [{start}, {end}] is outside "
                     f"the available range [0, {total_single - 1}]."
                 )
-            self.student_single_blocks.append(copy.deepcopy(transformer.single_transformer_blocks[start]))
+            student_block = make_lora_student_block(
+                copy.deepcopy(transformer.single_transformer_blocks[start]),
+                rank=self.lora_rank,
+                alpha=self.lora_alpha,
+                dropout=self.lora_dropout,
+                target_modules=self.lora_target_modules,
+            )
+            self.student_single_blocks.append(student_block)
             self.single_interval_specs.append(
                 IntervalSpec(stream="single", start=start, end=end, student_index=idx)
             )
@@ -450,7 +515,13 @@ class PruningDepthDistillationLoss(nn.Module):
         state_path = output_dir / "depth_distillation_students.safetensors"
         meta_path = output_dir / "depth_distillation_config.json"
 
-        state = {key: value.detach().cpu() for key, value in self.state_dict().items()}
+        state: dict[str, torch.Tensor] = {}
+        for index, block in enumerate(self.student_double_blocks):
+            for key, value in get_peft_model_state_dict(block).items():
+                state[f"student_double_blocks.{index}.{key}"] = value.detach().cpu()
+        for index, block in enumerate(self.student_single_blocks):
+            for key, value in get_peft_model_state_dict(block).items():
+                state[f"student_single_blocks.{index}.{key}"] = value.detach().cpu()
         try:
             import safetensors.torch
 
@@ -464,6 +535,10 @@ class PruningDepthDistillationLoss(nn.Module):
             "teacher_path": self.teacher_path,
             "depth_weight": self.depth_weight,
             "normalize_eps": self.normalize_eps,
+            "lora_rank": self.lora_rank,
+            "lora_alpha": self.lora_alpha,
+            "lora_dropout": self.lora_dropout,
+            "lora_target_modules": self.lora_target_modules,
             "double_stream_intervals": [[spec.start, spec.end] for spec in self.double_interval_specs],
             "single_stream_intervals": [[spec.start, spec.end] for spec in self.single_interval_specs],
         }
