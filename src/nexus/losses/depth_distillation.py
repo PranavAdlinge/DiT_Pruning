@@ -210,6 +210,30 @@ def _module_device(module: nn.Module) -> torch.device:
     return next(module.parameters()).device
 
 
+def _module_dtype(module: nn.Module) -> torch.dtype:
+    return next(module.parameters()).dtype
+
+
+def _move_module_to_reference(module: nn.Module, reference: torch.Tensor) -> None:
+    dtype = reference.dtype if reference.is_floating_point() else _module_dtype(module)
+    module.to(device=reference.device, dtype=dtype)
+
+
+def _move_value_to_device(value, *, device: torch.device, dtype: torch.dtype):
+    if isinstance(value, torch.Tensor):
+        kwargs = {"device": device}
+        if value.is_floating_point():
+            kwargs["dtype"] = dtype
+        return value.to(**kwargs)
+    if isinstance(value, tuple):
+        return tuple(_move_value_to_device(v, device=device, dtype=dtype) for v in value)
+    if isinstance(value, list):
+        return [_move_value_to_device(v, device=device, dtype=dtype) for v in value]
+    if isinstance(value, dict):
+        return {k: _move_value_to_device(v, device=device, dtype=dtype) for k, v in value.items()}
+    return value
+
+
 def _find_lora_target_modules(module: nn.Module) -> list[str]:
     target_modules: list[str] = []
     for name, child in module.named_modules():
@@ -408,14 +432,16 @@ class PruningDepthDistillationLoss(nn.Module):
         for index, block in enumerate(self.student_double_blocks):
             prefix = f"student_double_blocks.{index}."
             block_state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
-            if block_state:
-                set_peft_model_state_dict(block, block_state, adapter_name="default")
+            if not block_state:
+                raise ValueError(f"Missing checkpoint state for {prefix.rstrip('.')}")
+            set_peft_model_state_dict(block, block_state, adapter_name="default")
 
         for index, block in enumerate(self.student_single_blocks):
             prefix = f"student_single_blocks.{index}."
             block_state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
-            if block_state:
-                set_peft_model_state_dict(block, block_state, adapter_name="default")
+            if not block_state:
+                raise ValueError(f"Missing checkpoint state for {prefix.rstrip('.')}")
+            set_peft_model_state_dict(block, block_state, adapter_name="default")
 
     def _validate_checkpoint_metadata(self, meta: dict) -> None:
         current_double = [[spec.start, spec.end] for spec in self.double_interval_specs]
@@ -429,6 +455,29 @@ class PruningDepthDistillationLoss(nn.Module):
             raise ValueError(
                 "Checkpoint single-stream intervals do not match the current config: "
                 f"{meta['single_stream_intervals']} vs {current_single}"
+            )
+        current_double_sources = [spec.source_index for spec in self.double_interval_specs]
+        current_single_sources = [spec.source_index for spec in self.single_interval_specs]
+        if (
+            "double_stream_student_sources" in meta
+            and meta["double_stream_student_sources"] != current_double_sources
+        ):
+            raise ValueError(
+                "Checkpoint double-stream source blocks do not match the current config: "
+                f"{meta['double_stream_student_sources']} vs {current_double_sources}"
+            )
+        if (
+            "single_stream_student_sources" in meta
+            and meta["single_stream_student_sources"] != current_single_sources
+        ):
+            raise ValueError(
+                "Checkpoint single-stream source blocks do not match the current config: "
+                f"{meta['single_stream_student_sources']} vs {current_single_sources}"
+            )
+        if "student_block_init" in meta and meta["student_block_init"] != self.student_block_init:
+            raise ValueError(
+                "Checkpoint student_block_init does not match the current config: "
+                f"{meta['student_block_init']!r} vs {self.student_block_init!r}"
             )
 
     def _load_checkpoint_metadata(self, input_dir: str | Path) -> dict | None:
@@ -529,6 +578,7 @@ class PruningDepthDistillationLoss(nn.Module):
 
     def _ensure_teacher(self) -> torch.nn.Module:
         if self._teacher is not None:
+            self._teacher.to(device=self.device, dtype=self.dtype)
             return self._teacher
 
         teacher = self.transformer_cls.from_pretrained(
@@ -645,6 +695,9 @@ class PruningDepthDistillationLoss(nn.Module):
         }
 
     def _compute_flux2_depth_loss(self, teacher: torch.nn.Module, ctx: LossContext) -> tuple[torch.Tensor, dict[str, float]]:
+        self.device = ctx.packed_noisy.device
+        self.dtype = ctx.packed_noisy.dtype
+        teacher = self._ensure_teacher()
         teacher_inputs = self._prepare_flux2_inputs(teacher, ctx)
         encoder_hidden_states = teacher_inputs["encoder_hidden_states"]
         hidden_states = teacher_inputs["hidden_states"]
@@ -700,23 +753,42 @@ class PruningDepthDistillationLoss(nn.Module):
                 if index_block + 1 in single_starts:
                     single_start_states[index_block + 1] = single_hidden_states
 
-        if self.student_double_blocks:
-            device = _module_device(self.student_double_blocks[0])
-        else:
-            device = _module_device(self.student_single_blocks[0])
+        device = ctx.packed_noisy.device
         total_loss = torch.zeros((), device=device)
         double_loss = torch.zeros((), device=device)
         single_loss = torch.zeros((), device=device)
 
         for spec in self.double_interval_specs:
+            student_block = self.student_double_blocks[spec.student_index]
             start_encoder_hidden_states, start_hidden_states = double_start_states[spec.start]
             end_encoder_hidden_states, end_hidden_states = double_end_states[spec.end]
-            student_encoder_hidden_states, student_hidden_states = self.student_double_blocks[spec.student_index](
+            _move_module_to_reference(student_block, start_hidden_states)
+            student_device = _module_device(student_block)
+            student_dtype = _module_dtype(student_block)
+            start_encoder_hidden_states = _move_value_to_device(
+                start_encoder_hidden_states, device=student_device, dtype=student_dtype
+            )
+            start_hidden_states = _move_value_to_device(
+                start_hidden_states, device=student_device, dtype=student_dtype
+            )
+            end_encoder_hidden_states = _move_value_to_device(
+                end_encoder_hidden_states, device=student_device, dtype=student_dtype
+            )
+            end_hidden_states = _move_value_to_device(
+                end_hidden_states, device=student_device, dtype=student_dtype
+            )
+            student_encoder_hidden_states, student_hidden_states = student_block(
                 hidden_states=start_hidden_states,
                 encoder_hidden_states=start_encoder_hidden_states,
-                temb_mod_img=double_stream_mod_img,
-                temb_mod_txt=double_stream_mod_txt,
-                image_rotary_emb=concat_rotary_emb,
+                temb_mod_img=_move_value_to_device(
+                    double_stream_mod_img, device=student_device, dtype=student_dtype
+                ),
+                temb_mod_txt=_move_value_to_device(
+                    double_stream_mod_txt, device=student_device, dtype=student_dtype
+                ),
+                image_rotary_emb=_move_value_to_device(
+                    concat_rotary_emb, device=student_device, dtype=student_dtype
+                ),
                 joint_attention_kwargs=None,
             )
             interval_loss = _normalized_mse(
@@ -731,13 +803,27 @@ class PruningDepthDistillationLoss(nn.Module):
             double_loss = double_loss + interval_loss
 
         for spec in self.single_interval_specs:
+            student_block = self.student_single_blocks[spec.student_index]
             start_hidden_states = single_start_states[spec.start]
             end_hidden_states = single_end_states[spec.end]
-            student_hidden_states = self.student_single_blocks[spec.student_index](
+            _move_module_to_reference(student_block, start_hidden_states)
+            student_device = _module_device(student_block)
+            student_dtype = _module_dtype(student_block)
+            start_hidden_states = _move_value_to_device(
+                start_hidden_states, device=student_device, dtype=student_dtype
+            )
+            end_hidden_states = _move_value_to_device(
+                end_hidden_states, device=student_device, dtype=student_dtype
+            )
+            student_hidden_states = student_block(
                 hidden_states=start_hidden_states,
                 encoder_hidden_states=None,
-                temb_mod=single_stream_mod,
-                image_rotary_emb=concat_rotary_emb,
+                temb_mod=_move_value_to_device(
+                    single_stream_mod, device=student_device, dtype=student_dtype
+                ),
+                image_rotary_emb=_move_value_to_device(
+                    concat_rotary_emb, device=student_device, dtype=student_dtype
+                ),
                 joint_attention_kwargs=None,
             )
             interval_loss = _normalized_mse(
