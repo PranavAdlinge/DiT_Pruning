@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import inspect
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -58,6 +59,18 @@ def _build_depth_distillation_loss(cfg, *, device: torch.device, weight_dtype: t
         device=device,
         weight_dtype=weight_dtype,
     )
+    ctor = cfg.loss._class.__init__ if inspect.isclass(cfg.loss._class) else cfg.loss._class
+    signature = inspect.signature(ctor)
+    accepts_var_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
+    )
+    if not accepts_var_kwargs:
+        supported = {
+            name
+            for name, param in signature.parameters.items()
+            if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+        loss_kwargs = {key: value for key, value in loss_kwargs.items() if key in supported}
     loss = cfg.loss._class(**loss_kwargs)
     if not hasattr(loss, "load_checkpoint_artifacts") or not hasattr(loss, "apply_students_to_transformer"):
         raise ValueError(
