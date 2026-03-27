@@ -92,49 +92,32 @@ def _make_skip_transformer_checkpoint_hooks(accelerator: Accelerator, trans_cls:
     """Skip saving/loading the frozen base transformer for loss-managed training."""
 
     def save_hook(models, weights, output_dir):
-        skip_indices: list[int] = []
         custom_modules: list[nn.Module] = []
 
         trans_idx = next(
             (idx for idx, model in enumerate(models) if isinstance(unwrap_fn(model), trans_cls)),
             None,
         )
-        if trans_idx is not None:
-            skip_indices.append(trans_idx)
 
         for idx, model in enumerate(models):
             unwrapped = unwrap_fn(model)
             if hasattr(unwrapped, "save_checkpoint_artifacts"):
-                skip_indices.append(idx)
                 custom_modules.append(unwrapped)
 
-        if weights:
-            for idx in sorted(set(skip_indices), reverse=True):
-                if idx < len(weights):
-                    weights.pop(idx)
+        if trans_idx is not None and weights and trans_idx < len(weights):
+            weights.pop(trans_idx)
 
         if accelerator.is_main_process:
             for module in custom_modules:
                 module.save_checkpoint_artifacts(output_dir)
 
     def load_hook(models, input_dir):
-        pop_indices: list[int] = []
-
         trans_idx = next(
             (idx for idx, model in enumerate(models) if isinstance(unwrap_fn(model), trans_cls)),
             None,
         )
         if trans_idx is not None:
-            pop_indices.append(trans_idx)
-
-        for idx, model in enumerate(models):
-            unwrapped = unwrap_fn(model)
-            if hasattr(unwrapped, "load_checkpoint_artifacts"):
-                unwrapped.load_checkpoint_artifacts(input_dir)
-                pop_indices.append(idx)
-
-        for idx in sorted(set(pop_indices), reverse=True):
-            models.pop(idx)
+            models.pop(trans_idx)
 
     return save_hook, load_hook
 

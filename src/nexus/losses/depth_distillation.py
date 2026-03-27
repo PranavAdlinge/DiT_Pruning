@@ -389,10 +389,10 @@ class PruningDepthDistillationLoss(nn.Module):
         state: dict[str, torch.Tensor] = {}
         for index, block in enumerate(self.student_double_blocks):
             for key, value in get_peft_model_state_dict(block).items():
-                state[f"student_double_blocks.{index}.{key}"] = value.detach().cpu()
+                state[f"student_double_blocks.{index}.{key}"] = value.detach().cpu().clone().contiguous()
         for index, block in enumerate(self.student_single_blocks):
             for key, value in get_peft_model_state_dict(block).items():
-                state[f"student_single_blocks.{index}.{key}"] = value.detach().cpu()
+                state[f"student_single_blocks.{index}.{key}"] = value.detach().cpu().clone().contiguous()
         return state
 
     def _student_metadata(self) -> dict:
