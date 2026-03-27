@@ -1,4 +1,7 @@
 # Non-sequential pruning depth distillation on Flux.2 Klein base 4B.
+# This follows the Qwen-style interval compression setup: each pruned interval
+# is replaced by one LoRA-augmented student block, initialized from the
+# interval midpoint by default.
 extends: base.yaml
 
 dataset:
@@ -41,6 +44,7 @@ loss:
     pretrained_model_name_or_path: black-forest-labs/FLUX.2-klein-base-4B
     depth_weight: 1.0
     lora_rank: 128
+    student_block_init: midpoint
     pruned_blocks:
       - ["d1", "d2"]
       - ["s2", "s4"]

@@ -1,6 +1,7 @@
 # Non-sequential pruning depth distillation on Flux.2 Klein 4B.
 # This regimen keeps the teacher/data path unchanged and trains standalone
-# student blocks cloned from the first block in each pruned interval.
+# student blocks using the Qwen-style interval compression setup, with one
+# LoRA-augmented replacement block initialized from the interval midpoint.
 extends: base.yaml
 
 dataset:
@@ -43,6 +44,7 @@ loss:
     pretrained_model_name_or_path: black-forest-labs/FLUX.2-klein-base-4B
     depth_weight: 1.0
     lora_rank: 128
+    student_block_init: midpoint
     pruned_blocks:
       - ["d1", "d2"]
       - ["s2", "s4"]

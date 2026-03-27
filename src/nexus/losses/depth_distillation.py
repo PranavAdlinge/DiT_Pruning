@@ -1,11 +1,12 @@
 """
 Non-sequential depth distillation for pruned Flux.2 transformer intervals.
 
-This loss trains standalone student blocks cloned from the first block of each
-pruned interval, with trainable LoRA adapters attached to those cloned blocks.
-The student output is matched against the frozen teacher representation at the
-end of the interval, following the interval-wise formulation described by the
-user.
+This loss trains standalone student blocks cloned from each pruned interval,
+with trainable LoRA adapters attached to those cloned blocks. By default the
+student is initialized from the interval midpoint, matching the Qwen pruning
+distillation setup that compresses an interval into one replacement block. The
+student output is matched against the frozen teacher representation at the end
+of the interval.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ class IntervalSpec:
     stream: str
     start: int
     end: int
+    source_index: int
     student_index: int
 
 
@@ -80,6 +82,56 @@ def _parse_interval_entry(value, expected_stream: str | None = None) -> tuple[st
     return stream, start, end
 
 
+def _coalesce_indices(indices: list[int]) -> list[tuple[int, int]]:
+    if not indices:
+        return []
+
+    merged: list[tuple[int, int]] = []
+    start = prev = indices[0]
+    for index in indices[1:]:
+        if index == prev + 1:
+            prev = index
+            continue
+        merged.append((start, prev))
+        start = prev = index
+    merged.append((start, prev))
+    return merged
+
+
+def _parse_interval_collection(
+    values,
+    *,
+    expected_stream: str | None = None,
+) -> list[tuple[int, int]]:
+    if values is None:
+        return []
+
+    explicit_intervals: list[tuple[int, int]] = []
+    block_indices: list[int] = []
+
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            _, start, end = _parse_interval_entry(value, expected_stream=expected_stream)
+            explicit_intervals.append((start, end))
+        else:
+            _, index = _parse_stream_index(value, expected_stream=expected_stream)
+            block_indices.append(index)
+
+    return sorted(set(explicit_intervals + _coalesce_indices(sorted(set(block_indices)))))
+
+
+def _resolve_student_source_index(start: int, end: int, mode: str) -> int:
+    mode = str(mode).strip().lower()
+    if mode == "start":
+        return start
+    if mode == "midpoint":
+        return (start + end) // 2
+    raise ValueError(
+        "student_block_init must be one of {'start', 'midpoint'}, "
+        f"got {mode!r}."
+    )
+
+
 def parse_pruning_intervals(
     *,
     pruned_blocks=None,
@@ -91,8 +143,11 @@ def parse_pruning_intervals(
 
     Accepted formats:
     - `pruned_blocks: [["d1", "d2"], ["s2", "s4"]]`
+    - `pruned_blocks: ["d1", "d2", "s2", "s3", "s4"]`
     - `double_stream_pruned_blocks: [[1, 2]]`
+    - `double_stream_pruned_blocks: [1, 2]`
     - `single_stream_pruned_blocks: [["s2", "s4"]]`
+    - `single_stream_pruned_blocks: ["s2", "s3", "s4"]`
     """
 
     if pruned_blocks is not None and (
@@ -106,21 +161,32 @@ def parse_pruning_intervals(
     single_intervals: list[tuple[int, int]] = []
 
     if pruned_blocks is not None:
+        double_block_indices: list[int] = []
+        single_block_indices: list[int] = []
         for value in pruned_blocks:
-            stream, start, end = _parse_interval_entry(value)
-            if stream == "d":
-                double_intervals.append((start, end))
+            if isinstance(value, (list, tuple)):
+                stream, start, end = _parse_interval_entry(value)
+                if stream == "d":
+                    double_intervals.append((start, end))
+                else:
+                    single_intervals.append((start, end))
             else:
-                single_intervals.append((start, end))
+                stream, index = _parse_stream_index(value)
+                if stream == "d":
+                    double_block_indices.append(index)
+                else:
+                    single_block_indices.append(index)
+        double_intervals.extend(_coalesce_indices(sorted(set(double_block_indices))))
+        single_intervals.extend(_coalesce_indices(sorted(set(single_block_indices))))
     else:
-        if double_stream_pruned_blocks is not None:
-            for value in double_stream_pruned_blocks:
-                _, start, end = _parse_interval_entry(value, expected_stream="d")
-                double_intervals.append((start, end))
-        if single_stream_pruned_blocks is not None:
-            for value in single_stream_pruned_blocks:
-                _, start, end = _parse_interval_entry(value, expected_stream="s")
-                single_intervals.append((start, end))
+        double_intervals = _parse_interval_collection(
+            double_stream_pruned_blocks,
+            expected_stream="d",
+        )
+        single_intervals = _parse_interval_collection(
+            single_stream_pruned_blocks,
+            expected_stream="s",
+        )
 
     return sorted(set(double_intervals)), sorted(set(single_intervals))
 
@@ -182,9 +248,10 @@ class PruningDepthDistillationLoss(nn.Module):
     Interval-wise depth distillation for Flux.2 pruning.
 
     The student consists of frozen cloned blocks with trainable LoRA adapters
-    attached to the first block of each pruned interval. Each student block
-    receives the frozen teacher input at the start of the interval and matches
-    the teacher output at the end of the interval.
+    attached to a per-interval source block. By default this source block is
+    the interval midpoint, matching the Qwen-style interval compression flow.
+    Each student block receives the frozen teacher input at the start of the
+    interval and matches the teacher output at the end of the interval.
     """
 
     manages_model_forward = True
@@ -202,6 +269,7 @@ class PruningDepthDistillationLoss(nn.Module):
         lora_alpha: int | None = None,
         lora_dropout: float = 0.0,
         lora_target_modules: list[str] | None = None,
+        student_block_init: str = "midpoint",
         depth_weight: float = 1.0,
         normalize_eps: float = 1.0e-6,
         transformer_cls: type | None = None,
@@ -223,6 +291,7 @@ class PruningDepthDistillationLoss(nn.Module):
         self.lora_alpha = lora_rank if lora_alpha is None else lora_alpha
         self.lora_dropout = lora_dropout
         self.lora_target_modules = lora_target_modules
+        self.student_block_init = student_block_init
 
         self.double_intervals, self.single_intervals = parse_pruning_intervals(
             pruned_blocks=pruned_blocks,
@@ -288,8 +357,9 @@ class PruningDepthDistillationLoss(nn.Module):
                     f"Double-stream pruning interval [{start}, {end}] is outside "
                     f"the available range [0, {total_double - 1}]."
                 )
+            source_index = _resolve_student_source_index(start, end, self.student_block_init)
             student_block = make_lora_student_block(
-                copy.deepcopy(transformer.transformer_blocks[start]),
+                copy.deepcopy(transformer.transformer_blocks[source_index]),
                 rank=self.lora_rank,
                 alpha=self.lora_alpha,
                 dropout=self.lora_dropout,
@@ -297,7 +367,13 @@ class PruningDepthDistillationLoss(nn.Module):
             )
             self.student_double_blocks.append(student_block)
             self.double_interval_specs.append(
-                IntervalSpec(stream="double", start=start, end=end, student_index=idx)
+                IntervalSpec(
+                    stream="double",
+                    start=start,
+                    end=end,
+                    source_index=source_index,
+                    student_index=idx,
+                )
             )
 
         for idx, (start, end) in enumerate(self.single_intervals):
@@ -311,8 +387,9 @@ class PruningDepthDistillationLoss(nn.Module):
                     f"Single-stream pruning interval [{start}, {end}] is outside "
                     f"the available range [0, {total_single - 1}]."
                 )
+            source_index = _resolve_student_source_index(start, end, self.student_block_init)
             student_block = make_lora_student_block(
-                copy.deepcopy(transformer.single_transformer_blocks[start]),
+                copy.deepcopy(transformer.single_transformer_blocks[source_index]),
                 rank=self.lora_rank,
                 alpha=self.lora_alpha,
                 dropout=self.lora_dropout,
@@ -320,7 +397,13 @@ class PruningDepthDistillationLoss(nn.Module):
             )
             self.student_single_blocks.append(student_block)
             self.single_interval_specs.append(
-                IntervalSpec(stream="single", start=start, end=end, student_index=idx)
+                IntervalSpec(
+                    stream="single",
+                    start=start,
+                    end=end,
+                    source_index=source_index,
+                    student_index=idx,
+                )
             )
 
         self._prepared = True
@@ -539,8 +622,11 @@ class PruningDepthDistillationLoss(nn.Module):
             "lora_alpha": self.lora_alpha,
             "lora_dropout": self.lora_dropout,
             "lora_target_modules": self.lora_target_modules,
+            "student_block_init": self.student_block_init,
             "double_stream_intervals": [[spec.start, spec.end] for spec in self.double_interval_specs],
+            "double_stream_student_sources": [spec.source_index for spec in self.double_interval_specs],
             "single_stream_intervals": [[spec.start, spec.end] for spec in self.single_interval_specs],
+            "single_stream_student_sources": [spec.source_index for spec in self.single_interval_specs],
         }
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return [state_path, meta_path]

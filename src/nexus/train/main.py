@@ -247,6 +247,11 @@ def main(args=None):
         transformer.add_adapter(lora_config)
     elif train_base_model and train_mode == "full":
         transformer.requires_grad_(True)
+    elif not train_base_model and accelerator.is_main_process:
+        logger.info(
+            "Loss-managed training detected: top-level train_mode/lora config is ignored; "
+            "trainable student adapters should be configured under loss.kwargs."
+        )
 
     pipeline_cls = pipeline_cfg._class if checkpoint_train_mode == "lora" else None
 
