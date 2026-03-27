@@ -214,11 +214,6 @@ def _module_dtype(module: nn.Module) -> torch.dtype:
     return next(module.parameters()).dtype
 
 
-def _move_module_to_reference(module: nn.Module, reference: torch.Tensor) -> None:
-    dtype = reference.dtype if reference.is_floating_point() else _module_dtype(module)
-    module.to(device=reference.device, dtype=dtype)
-
-
 def _move_value_to_device(value, *, device: torch.device, dtype: torch.dtype):
     if isinstance(value, torch.Tensor):
         kwargs = {"device": device}
@@ -526,13 +521,15 @@ class PruningDepthDistillationLoss(nn.Module):
                     f"the available range [0, {total_double - 1}]."
                 )
             source_index = _resolve_student_source_index(start, end, self.student_block_init)
+            source_block = transformer.transformer_blocks[source_index]
             student_block = make_lora_student_block(
-                copy.deepcopy(transformer.transformer_blocks[source_index]),
+                copy.deepcopy(source_block),
                 rank=self.lora_rank,
                 alpha=self.lora_alpha,
                 dropout=self.lora_dropout,
                 target_modules=self.lora_target_modules,
             )
+            student_block.to(device=_module_device(source_block), dtype=_module_dtype(source_block))
             self.student_double_blocks.append(student_block)
             self.double_interval_specs.append(
                 IntervalSpec(
@@ -556,13 +553,15 @@ class PruningDepthDistillationLoss(nn.Module):
                     f"the available range [0, {total_single - 1}]."
                 )
             source_index = _resolve_student_source_index(start, end, self.student_block_init)
+            source_block = transformer.single_transformer_blocks[source_index]
             student_block = make_lora_student_block(
-                copy.deepcopy(transformer.single_transformer_blocks[source_index]),
+                copy.deepcopy(source_block),
                 rank=self.lora_rank,
                 alpha=self.lora_alpha,
                 dropout=self.lora_dropout,
                 target_modules=self.lora_target_modules,
             )
+            student_block.to(device=_module_device(source_block), dtype=_module_dtype(source_block))
             self.student_single_blocks.append(student_block)
             self.single_interval_specs.append(
                 IntervalSpec(
@@ -762,7 +761,6 @@ class PruningDepthDistillationLoss(nn.Module):
             student_block = self.student_double_blocks[spec.student_index]
             start_encoder_hidden_states, start_hidden_states = double_start_states[spec.start]
             end_encoder_hidden_states, end_hidden_states = double_end_states[spec.end]
-            _move_module_to_reference(student_block, start_hidden_states)
             student_device = _module_device(student_block)
             student_dtype = _module_dtype(student_block)
             start_encoder_hidden_states = _move_value_to_device(
@@ -800,13 +798,12 @@ class PruningDepthDistillationLoss(nn.Module):
                 end_hidden_states,
                 self.normalize_eps,
             )
-            double_loss = double_loss + interval_loss
+            double_loss = double_loss + interval_loss.to(device=device)
 
         for spec in self.single_interval_specs:
             student_block = self.student_single_blocks[spec.student_index]
             start_hidden_states = single_start_states[spec.start]
             end_hidden_states = single_end_states[spec.end]
-            _move_module_to_reference(student_block, start_hidden_states)
             student_device = _module_device(student_block)
             student_dtype = _module_dtype(student_block)
             start_hidden_states = _move_value_to_device(
@@ -831,7 +828,7 @@ class PruningDepthDistillationLoss(nn.Module):
                 end_hidden_states,
                 self.normalize_eps,
             )
-            single_loss = single_loss + interval_loss
+            single_loss = single_loss + interval_loss.to(device=device)
 
         total_loss = self.depth_weight * (double_loss + single_loss)
         return total_loss, {

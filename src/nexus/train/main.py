@@ -234,6 +234,7 @@ def main(args=None):
         torch_dtype=weight_dtype,
     )
     transformer.requires_grad_(False)
+    transformer.to(device=accelerator.device, dtype=weight_dtype)
 
     loss_cfg = cfg.loss
     loss_fn = build_loss_fn(cfg, model_cfg=model_cfg, accelerator=accelerator, weight_dtype=weight_dtype)
@@ -275,7 +276,6 @@ def main(args=None):
         dest = Path(cfg.output_dir) / "config.yaml"
         shutil.copy2(config_path, dest)
         logger.info("Config copied to %s", dest)
-    transformer.to(device=accelerator.device, dtype=weight_dtype)
 
     is_fsdp = getattr(accelerator.state, "fsdp_plugin", None) is not None
     unwrap = lambda m: unwrap_model(accelerator, m)
