@@ -381,9 +381,14 @@ def main(args=None):
     )
 
     if loss_module is not None:
-        transformer, loss_module, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            transformer, loss_module, optimizer, train_dataloader, lr_scheduler
-        )
+        if train_base_model:
+            transformer, loss_module, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                transformer, loss_module, optimizer, train_dataloader, lr_scheduler
+            )
+        else:
+            loss_module, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                loss_module, optimizer, train_dataloader, lr_scheduler
+            )
         loss_fn = loss_module
     else:
         transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
