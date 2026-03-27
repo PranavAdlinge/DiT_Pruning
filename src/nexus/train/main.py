@@ -88,24 +88,53 @@ def _collect_trainable_params(*modules: nn.Module) -> list[torch.nn.Parameter]:
     return params
 
 
-def _make_skip_transformer_checkpoint_hooks(trans_cls: type, unwrap_fn):
+def _make_skip_transformer_checkpoint_hooks(accelerator: Accelerator, trans_cls: type, unwrap_fn):
     """Skip saving/loading the frozen base transformer for loss-managed training."""
 
     def save_hook(models, weights, output_dir):
-        trans_idx = next(
-            (idx for idx, model in enumerate(models) if isinstance(unwrap_fn(model), trans_cls)),
-            None,
-        )
-        if trans_idx is not None and weights and trans_idx < len(weights):
-            weights.pop(trans_idx)
+        skip_indices: list[int] = []
+        custom_modules: list[nn.Module] = []
 
-    def load_hook(models, input_dir):
         trans_idx = next(
             (idx for idx, model in enumerate(models) if isinstance(unwrap_fn(model), trans_cls)),
             None,
         )
         if trans_idx is not None:
-            models.pop(trans_idx)
+            skip_indices.append(trans_idx)
+
+        for idx, model in enumerate(models):
+            unwrapped = unwrap_fn(model)
+            if hasattr(unwrapped, "save_checkpoint_artifacts"):
+                skip_indices.append(idx)
+                custom_modules.append(unwrapped)
+
+        if weights:
+            for idx in sorted(set(skip_indices), reverse=True):
+                if idx < len(weights):
+                    weights.pop(idx)
+
+        if accelerator.is_main_process:
+            for module in custom_modules:
+                module.save_checkpoint_artifacts(output_dir)
+
+    def load_hook(models, input_dir):
+        pop_indices: list[int] = []
+
+        trans_idx = next(
+            (idx for idx, model in enumerate(models) if isinstance(unwrap_fn(model), trans_cls)),
+            None,
+        )
+        if trans_idx is not None:
+            pop_indices.append(trans_idx)
+
+        for idx, model in enumerate(models):
+            unwrapped = unwrap_fn(model)
+            if hasattr(unwrapped, "load_checkpoint_artifacts"):
+                unwrapped.load_checkpoint_artifacts(input_dir)
+                pop_indices.append(idx)
+
+        for idx in sorted(set(pop_indices), reverse=True):
+            models.pop(idx)
 
     return save_hook, load_hook
 
@@ -289,7 +318,7 @@ def main(args=None):
             mixed_precision=mp,
         )
     else:
-        save_hook, load_hook = _make_skip_transformer_checkpoint_hooks(trans_cls, unwrap)
+        save_hook, load_hook = _make_skip_transformer_checkpoint_hooks(accelerator, trans_cls, unwrap)
     accelerator.register_save_state_pre_hook(save_hook)
     accelerator.register_load_state_pre_hook(load_hook)
 
@@ -437,17 +466,24 @@ def main(args=None):
 
     resume = getattr(cfg, "resume_from_checkpoint", None)
     if resume:
-        path = resume
-        if path == "latest":
+        resume_path = None
+        if resume == "latest":
             dirs = [d for d in os.listdir(cfg.output_dir) if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if dirs else None
+            if dirs:
+                resume_path = Path(cfg.output_dir) / dirs[-1]
         else:
-            path = os.path.basename(path)
-        if path:
-            accelerator.print(f"Resuming from {path}")
-            accelerator.load_state(os.path.join(cfg.output_dir, path))
-            global_step = int(path.split("-")[1])
+            candidate = Path(resume)
+            if candidate.exists():
+                resume_path = candidate
+            else:
+                candidate = Path(cfg.output_dir) / os.path.basename(str(resume))
+                if candidate.exists():
+                    resume_path = candidate
+        if resume_path is not None:
+            accelerator.print(f"Resuming from {resume_path}")
+            accelerator.load_state(str(resume_path))
+            global_step = int(resume_path.name.split("-")[1])
             first_epoch = global_step // num_updates_per_epoch
         else:
             resume = None

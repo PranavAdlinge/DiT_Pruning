@@ -19,9 +19,13 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from peft import LoraConfig, get_peft_model
-from peft.utils import get_peft_model_state_dict
+from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
 
 from .context import LossContext
+
+DEPTH_DISTILLATION_STATE_SAFE = "depth_distillation_students.safetensors"
+DEPTH_DISTILLATION_STATE_PT = "depth_distillation_students.pt"
+DEPTH_DISTILLATION_META = "depth_distillation_config.json"
 
 
 @dataclass(frozen=True)
@@ -243,6 +247,28 @@ def make_lora_student_block(
     return get_peft_model(block, lora_config)
 
 
+class _DoubleStreamPassthroughBlock(nn.Module):
+    def forward(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return encoder_hidden_states, hidden_states
+
+
+class _SingleStreamPassthroughBlock(nn.Module):
+    def forward(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        return hidden_states
+
+
 class PruningDepthDistillationLoss(nn.Module):
     """
     Interval-wise depth distillation for Flux.2 pruning.
@@ -317,6 +343,99 @@ class PruningDepthDistillationLoss(nn.Module):
 
         if self.transformer_cls is None or self.device is None:
             self._resolve_from_context(model_cfg, accelerator, weight_dtype)
+
+    @staticmethod
+    def _artifact_paths(output_dir: str | Path) -> tuple[Path, Path]:
+        output_dir = Path(output_dir)
+        return output_dir / DEPTH_DISTILLATION_STATE_SAFE, output_dir / DEPTH_DISTILLATION_META
+
+    @staticmethod
+    def _resolve_state_path(output_dir: str | Path) -> Path:
+        output_dir = Path(output_dir)
+        for name in (DEPTH_DISTILLATION_STATE_SAFE, DEPTH_DISTILLATION_STATE_PT):
+            path = output_dir / name
+            if path.exists():
+                return path
+        raise FileNotFoundError(
+            f"No depth-distillation student checkpoint found in {output_dir} "
+            f"(expected {DEPTH_DISTILLATION_STATE_SAFE} or {DEPTH_DISTILLATION_STATE_PT})."
+        )
+
+    def _student_state_dict(self) -> dict[str, torch.Tensor]:
+        state: dict[str, torch.Tensor] = {}
+        for index, block in enumerate(self.student_double_blocks):
+            for key, value in get_peft_model_state_dict(block).items():
+                state[f"student_double_blocks.{index}.{key}"] = value.detach().cpu()
+        for index, block in enumerate(self.student_single_blocks):
+            for key, value in get_peft_model_state_dict(block).items():
+                state[f"student_single_blocks.{index}.{key}"] = value.detach().cpu()
+        return state
+
+    def _student_metadata(self) -> dict:
+        return {
+            "teacher_path": self.teacher_path,
+            "depth_weight": self.depth_weight,
+            "normalize_eps": self.normalize_eps,
+            "lora_rank": self.lora_rank,
+            "lora_alpha": self.lora_alpha,
+            "lora_dropout": self.lora_dropout,
+            "lora_target_modules": self.lora_target_modules,
+            "student_block_init": self.student_block_init,
+            "double_stream_intervals": [[spec.start, spec.end] for spec in self.double_interval_specs],
+            "double_stream_student_sources": [spec.source_index for spec in self.double_interval_specs],
+            "single_stream_intervals": [[spec.start, spec.end] for spec in self.single_interval_specs],
+            "single_stream_student_sources": [spec.source_index for spec in self.single_interval_specs],
+        }
+
+    def _write_student_artifacts(self, output_dir: str | Path) -> list[Path]:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        state_path, meta_path = self._artifact_paths(output_dir)
+        state = self._student_state_dict()
+        try:
+            import safetensors.torch
+
+            safetensors.torch.save_file(state, str(state_path))
+        except ImportError:
+            state_path = state_path.with_suffix(".pt")
+            torch.save(state, state_path)
+
+        meta_path.write_text(json.dumps(self._student_metadata(), indent=2), encoding="utf-8")
+        return [state_path, meta_path]
+
+    def _load_student_state(self, state: dict[str, torch.Tensor]) -> None:
+        for index, block in enumerate(self.student_double_blocks):
+            prefix = f"student_double_blocks.{index}."
+            block_state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+            if block_state:
+                set_peft_model_state_dict(block, block_state, adapter_name="default")
+
+        for index, block in enumerate(self.student_single_blocks):
+            prefix = f"student_single_blocks.{index}."
+            block_state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+            if block_state:
+                set_peft_model_state_dict(block, block_state, adapter_name="default")
+
+    def _validate_checkpoint_metadata(self, meta: dict) -> None:
+        current_double = [[spec.start, spec.end] for spec in self.double_interval_specs]
+        current_single = [[spec.start, spec.end] for spec in self.single_interval_specs]
+        if "double_stream_intervals" in meta and meta["double_stream_intervals"] != current_double:
+            raise ValueError(
+                "Checkpoint double-stream intervals do not match the current config: "
+                f"{meta['double_stream_intervals']} vs {current_double}"
+            )
+        if "single_stream_intervals" in meta and meta["single_stream_intervals"] != current_single:
+            raise ValueError(
+                "Checkpoint single-stream intervals do not match the current config: "
+                f"{meta['single_stream_intervals']} vs {current_single}"
+            )
+
+    def _load_checkpoint_metadata(self, input_dir: str | Path) -> dict | None:
+        _, meta_path = self._artifact_paths(input_dir)
+        if not meta_path.exists():
+            return None
+        return json.loads(meta_path.read_text(encoding="utf-8"))
 
     def _resolve_from_context(self, model_cfg, accelerator, weight_dtype) -> None:
         if model_cfg is None or accelerator is None or weight_dtype is None:
@@ -424,6 +543,66 @@ class PruningDepthDistillationLoss(nn.Module):
         teacher.to(device=self.device, dtype=self.dtype)
         self.__dict__["_teacher"] = teacher
         return teacher
+
+    def save_checkpoint_artifacts(self, output_dir: str | Path) -> list[Path]:
+        return self._write_student_artifacts(output_dir)
+
+    def load_checkpoint_artifacts(self, input_dir: str | Path) -> list[Path]:
+        if not self._prepared:
+            raise RuntimeError(
+                "PruningDepthDistillationLoss.prepare_for_training(transformer) must be "
+                "called before loading checkpoint artifacts."
+            )
+
+        input_dir = Path(input_dir)
+        meta = self._load_checkpoint_metadata(input_dir)
+        if meta is not None:
+            self._validate_checkpoint_metadata(meta)
+
+        state_path = self._resolve_state_path(input_dir)
+        if state_path.suffix == ".safetensors":
+            try:
+                import safetensors.torch
+
+                state = dict(safetensors.torch.load_file(str(state_path)))
+            except ImportError:
+                fallback_path = state_path.with_suffix(".pt")
+                state = dict(torch.load(fallback_path, map_location="cpu", weights_only=True))
+                state_path = fallback_path
+        else:
+            state = dict(torch.load(state_path, map_location="cpu", weights_only=True))
+
+        self._load_student_state(state)
+        loaded_paths = [state_path]
+        _, meta_path = self._artifact_paths(input_dir)
+        if meta_path.exists():
+            loaded_paths.append(meta_path)
+        return loaded_paths
+
+    def apply_students_to_transformer(
+        self,
+        transformer: torch.nn.Module,
+        *,
+        merge_lora: bool = True,
+    ) -> torch.nn.Module:
+        if not self._prepared:
+            self.prepare_for_training(transformer)
+
+        for spec in self.double_interval_specs:
+            student_block = self.student_double_blocks[spec.student_index]
+            replacement = student_block.merge_and_unload() if merge_lora else student_block
+            transformer.transformer_blocks[spec.start] = replacement
+            for index in range(spec.start + 1, spec.end + 1):
+                transformer.transformer_blocks[index] = _DoubleStreamPassthroughBlock()
+
+        for spec in self.single_interval_specs:
+            student_block = self.student_single_blocks[spec.student_index]
+            replacement = student_block.merge_and_unload() if merge_lora else student_block
+            transformer.single_transformer_blocks[spec.start] = replacement
+            for index in range(spec.start + 1, spec.end + 1):
+                transformer.single_transformer_blocks[index] = _SingleStreamPassthroughBlock()
+
+        return transformer
 
     def _prepare_flux2_inputs(self, teacher: torch.nn.Module, ctx: LossContext) -> dict[str, torch.Tensor | None]:
         hidden_states = ctx.packed_noisy
@@ -592,41 +771,4 @@ class PruningDepthDistillationLoss(nn.Module):
         return self._compute_flux2_depth_loss(teacher, ctx)
 
     def save_training_artifacts(self, output_dir: str | Path) -> list[Path]:
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        state_path = output_dir / "depth_distillation_students.safetensors"
-        meta_path = output_dir / "depth_distillation_config.json"
-
-        state: dict[str, torch.Tensor] = {}
-        for index, block in enumerate(self.student_double_blocks):
-            for key, value in get_peft_model_state_dict(block).items():
-                state[f"student_double_blocks.{index}.{key}"] = value.detach().cpu()
-        for index, block in enumerate(self.student_single_blocks):
-            for key, value in get_peft_model_state_dict(block).items():
-                state[f"student_single_blocks.{index}.{key}"] = value.detach().cpu()
-        try:
-            import safetensors.torch
-
-            safetensors.torch.save_file(state, str(state_path))
-        except ImportError:
-            fallback_path = state_path.with_suffix(".pt")
-            torch.save(state, fallback_path)
-            state_path = fallback_path
-
-        meta = {
-            "teacher_path": self.teacher_path,
-            "depth_weight": self.depth_weight,
-            "normalize_eps": self.normalize_eps,
-            "lora_rank": self.lora_rank,
-            "lora_alpha": self.lora_alpha,
-            "lora_dropout": self.lora_dropout,
-            "lora_target_modules": self.lora_target_modules,
-            "student_block_init": self.student_block_init,
-            "double_stream_intervals": [[spec.start, spec.end] for spec in self.double_interval_specs],
-            "double_stream_student_sources": [spec.source_index for spec in self.double_interval_specs],
-            "single_stream_intervals": [[spec.start, spec.end] for spec in self.single_interval_specs],
-            "single_stream_student_sources": [spec.source_index for spec in self.single_interval_specs],
-        }
-        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        return [state_path, meta_path]
+        return self._write_student_artifacts(output_dir)

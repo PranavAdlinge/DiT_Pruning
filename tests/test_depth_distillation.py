@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from peft.utils import get_peft_model_state_dict
 
 from nexus.losses.depth_distillation import (
     PruningDepthDistillationLoss,
@@ -97,3 +98,37 @@ def test_teacher_is_not_registered_in_state_dict():
     loss.__dict__["_teacher"] = nn.Linear(4, 4, bias=False)
 
     assert all("_teacher" not in key for key in loss.state_dict().keys())
+
+
+def test_checkpoint_artifacts_round_trip_student_lora_weights(tmp_path):
+    transformer = _DummyTransformer()
+    loss = PruningDepthDistillationLoss(
+        pretrained_model_name_or_path="dummy",
+        pruned_blocks=[["d1", "d2"]],
+        transformer_cls=object,
+        device=torch.device("cpu"),
+    )
+    loss.prepare_for_training(transformer)
+
+    with torch.no_grad():
+        for param in loss.student_double_blocks[0].parameters():
+            if param.requires_grad:
+                param.fill_(0.25)
+
+    saved_paths = loss.save_checkpoint_artifacts(tmp_path)
+    assert saved_paths
+
+    restored_loss = PruningDepthDistillationLoss(
+        pretrained_model_name_or_path="dummy",
+        pruned_blocks=[["d1", "d2"]],
+        transformer_cls=object,
+        device=torch.device("cpu"),
+    )
+    restored_loss.prepare_for_training(_DummyTransformer())
+    restored_loss.load_checkpoint_artifacts(tmp_path)
+
+    restored_state = get_peft_model_state_dict(restored_loss.student_double_blocks[0])
+    reference_state = get_peft_model_state_dict(loss.student_double_blocks[0])
+    assert restored_state.keys() == reference_state.keys()
+    for key in restored_state:
+        assert torch.equal(restored_state[key], reference_state[key])
