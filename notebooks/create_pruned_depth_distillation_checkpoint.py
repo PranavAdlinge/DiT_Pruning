@@ -2,20 +2,20 @@
 Create a standalone pruned checkpoint from a depth-distillation training run.
 
 This script:
-1. Loads a base Flux.2 Klein checkpoint.
+1. Loads a base Flux.2 Klein transformer.
 2. Reads the depth-distillation YAML config.
 3. Rebuilds the student LoRA blocks described by the config.
 4. Loads the trained student LoRA weights from a checkpoint directory.
 5. Merges the LoRA weights into the copied student blocks.
 6. Physically removes the pruned blocks from the transformer.
-7. Saves a clean, loadable Diffusers pipeline bundle plus a small YAML config.
+7. Saves only the compact transformer weights and transformer config.
 
 Example:
     python notebooks/create_pruned_depth_distillation_checkpoint.py \
         --base_checkpoint black-forest-labs/FLUX.2-klein-base-4B \
         --config configs/klein4b-base/t2i_pruning_depth_distillation.yaml \
         --lora_checkpoint /path/to/checkpoint-1000 \
-        --output_dir /path/to/merged-checkpoint
+        --output_dir /path/to/merged-transformer
 """
 
 from __future__ import annotations
@@ -574,63 +574,6 @@ def compact_transformer(
     return transformer
 
 
-def build_load_config(
-    *,
-    raw_config: dict,
-    output_dir: Path,
-    base_checkpoint: str,
-    checkpoint_dir: Path,
-    double_specs: list[IntervalSpec],
-    single_specs: list[IntervalSpec],
-    transformer: nn.Module,
-) -> dict:
-    pipeline_cfg = raw_config.get("pipeline") or raw_config.get("model", {}).get("pipeline")
-    model_cfg = raw_config.get("model", {})
-    dit_cfg = model_cfg.get("dit") or model_cfg.get("transformer")
-    if pipeline_cfg is None or dit_cfg is None:
-        raise ValueError("Config must define pipeline and model.dit/model.transformer sections.")
-
-    load_config: dict = {
-        "pipeline": {
-            "class_name": pipeline_cfg["class_name"],
-            "pretrained_model_name_or_path": str(output_dir.resolve()),
-        },
-        "model": {
-            "dit": {
-                "class_name": dit_cfg["class_name"],
-                "subfolder": dit_cfg.get("subfolder", "transformer"),
-            },
-        },
-        "merged_depth_distillation": {
-            "base_checkpoint": base_checkpoint,
-            "student_checkpoint": str(checkpoint_dir.resolve()),
-            "double_stream_intervals": [[spec.start, spec.end] for spec in double_specs],
-            "double_stream_student_sources": [spec.source_index for spec in double_specs],
-            "single_stream_intervals": [[spec.start, spec.end] for spec in single_specs],
-            "single_stream_student_sources": [spec.source_index for spec in single_specs],
-            "num_layers": len(transformer.transformer_blocks),
-            "num_single_layers": len(getattr(transformer, "single_transformer_blocks", [])),
-        },
-    }
-
-    for key in ("mixed_precision", "latent_channels", "text_embed_hidden", "validation"):
-        if key in raw_config:
-            load_config[key] = raw_config[key]
-
-    for key in ("revision", "variant"):
-        if key in model_cfg:
-            load_config["model"][key] = model_cfg[key]
-
-    return load_config
-
-
-def save_yaml(data: dict, path: Path) -> None:
-    path.write_text(
-        yaml.safe_dump(data, sort_keys=False, default_flow_style=False),
-        encoding="utf-8",
-    )
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create a standalone pruned checkpoint from a depth-distillation LoRA checkpoint."
@@ -643,7 +586,12 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Checkpoint directory containing depth_distillation_students.* artifacts.",
     )
-    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the merged checkpoint.")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Directory to save the merged transformer checkpoint and config.",
+    )
     parser.add_argument(
         "--dtype",
         type=str,
@@ -664,19 +612,15 @@ def main() -> None:
     args = parse_args()
 
     raw_config = load_yaml_config(args.config)
-    pipeline_cfg = raw_config.get("pipeline") or raw_config.get("model", {}).get("pipeline")
     model_cfg = raw_config.get("model", {})
     dit_cfg = model_cfg.get("dit") or model_cfg.get("transformer")
     loss_cfg = raw_config.get("loss") or {}
     loss_kwargs = dict(loss_cfg.get("kwargs") or {})
 
-    if pipeline_cfg is None:
-        raise ValueError("The YAML config must define a `pipeline` section.")
     if dit_cfg is None:
         raise ValueError("The YAML config must define `model.dit` or `model.transformer`.")
 
     transformer_cls = resolve_class(dit_cfg["class_name"])
-    pipeline_cls = resolve_class(pipeline_cfg["class_name"])
     revision = model_cfg.get("revision")
     variant = model_cfg.get("variant")
     subfolder = dit_cfg.get("subfolder", "transformer")
@@ -743,42 +687,14 @@ def main() -> None:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Saving standalone pipeline bundle to: {output_dir}")
-    pipeline = pipeline_cls.from_pretrained(
-        args.base_checkpoint,
-        transformer=transformer,
-        revision=revision,
-        variant=variant,
-        torch_dtype=weight_dtype,
-    )
-    pipeline.save_pretrained(
+    print(f"Saving standalone transformer checkpoint to: {output_dir}")
+    transformer.save_pretrained(
         output_dir,
         safe_serialization=not args.disable_safe_serialization,
     )
 
-    load_config = build_load_config(
-        raw_config=raw_config,
-        output_dir=output_dir,
-        base_checkpoint=args.base_checkpoint,
-        checkpoint_dir=checkpoint_dir,
-        double_specs=double_specs,
-        single_specs=single_specs,
-        transformer=transformer,
-    )
-    merge_metadata = dict(load_config["merged_depth_distillation"])
-    merge_metadata["source_config"] = str(Path(args.config).resolve())
-
-    save_yaml(load_config, output_dir / "config.yaml")
-    save_yaml(raw_config, output_dir / "source_training_config.yaml")
-    (output_dir / "merge_metadata.json").write_text(
-        json.dumps(merge_metadata, indent=2),
-        encoding="utf-8",
-    )
-
     print("Done.")
-    print(f"Saved load config: {output_dir / 'config.yaml'}")
-    print(f"Saved source config copy: {output_dir / 'source_training_config.yaml'}")
-    print(f"Saved metadata: {output_dir / 'merge_metadata.json'}")
+    print(f"Saved transformer config: {output_dir / 'config.json'}")
     print(f"Final double-stream blocks: {len(transformer.transformer_blocks)}")
     print(f"Final single-stream blocks: {len(getattr(transformer, 'single_transformer_blocks', []))}")
 
