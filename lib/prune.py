@@ -256,7 +256,8 @@ def prune_OBS_Diff(args, pipe, target_modules,  dev, prune_n=0, prune_m=0, times
     print('Starting ...')
     dataloader = get_loaders(
         args.dataset,
-        num_samples=args.num_samples
+        num_samples=args.num_samples,
+        prompt_file=getattr(args, "prompt_file", None),
     )
     blocks = pipe.transformer.transformer_blocks
     target_pruned_modules = []
@@ -339,7 +340,8 @@ def prune_OBS_Diff_Structured(args, pipe, target_modules, dev, timestep_weight=N
     print('Starting ...')
     dataloader = get_loaders(
         args.dataset,
-        num_samples=args.num_samples  
+        num_samples=args.num_samples,
+        prompt_file=getattr(args, "prompt_file", None),
     )
 
     blocks = pipe.transformer.transformer_blocks
