@@ -288,6 +288,8 @@ class Flux2StructuredJointAttentionPruner(object):
 
             W1_prune = W1[:, :cnt].clone()
             W2_prune = W2[:, :cnt].clone()
+            local_hinv_1 = Hinv_1[:, :cnt]
+            local_hinv_2 = Hinv_2[:, :cnt]
             Err1 = torch.zeros_like(W1_prune)
             Err2 = torch.zeros_like(W2_prune)
 
@@ -295,8 +297,8 @@ class Flux2StructuredJointAttentionPruner(object):
                 Err1[:, i : i + 1] = W1_prune[:, i : i + 1] / Hinv_1[i, i]
                 Err2[:, i : i + 1] = W2_prune[:, i : i + 1] / Hinv_2[i, i]
                 if not self.no_compensate:
-                    W1_prune[:, i:] -= Err1[:, i : i + 1].matmul(Hinv_1[i : i + 1, i:])
-                    W2_prune[:, i:] -= Err2[:, i : i + 1].matmul(Hinv_2[i : i + 1, i:])
+                    W1_prune[:, i:] -= Err1[:, i : i + 1].matmul(local_hinv_1[i : i + 1, i:])
+                    W2_prune[:, i:] -= Err2[:, i : i + 1].matmul(local_hinv_2[i : i + 1, i:])
 
             W1[:, :cnt] = 0
             W2[:, :cnt] = 0

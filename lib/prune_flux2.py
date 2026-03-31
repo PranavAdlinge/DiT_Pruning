@@ -171,6 +171,81 @@ def check_flux2_size(transformer_model, args):
     print("=" * 50)
 
 
+def _validate_flux2_double_block(block, block_idx):
+    inner_dim = block.attn.inner_dim
+    head_dim = block.attn.head_dim
+    heads = block.attn.heads
+    if inner_dim != heads * head_dim:
+        raise ValueError(f"Double block {block_idx}: inner_dim {inner_dim} does not match heads * head_dim = {heads * head_dim}.")
+
+    if block.attn.to_out[0].in_features != inner_dim:
+        raise ValueError(
+            f"Double block {block_idx}: attn.to_out.0 in_features {block.attn.to_out[0].in_features} does not match inner_dim {inner_dim}."
+        )
+    if block.attn.to_add_out.in_features != inner_dim:
+        raise ValueError(
+            f"Double block {block_idx}: attn.to_add_out in_features {block.attn.to_add_out.in_features} does not match inner_dim {inner_dim}."
+        )
+
+    for layer_name in ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj"):
+        layer = getattr(block.attn, layer_name)
+        if layer.out_features != inner_dim:
+            raise ValueError(
+                f"Double block {block_idx}: attn.{layer_name} out_features {layer.out_features} does not match inner_dim {inner_dim}."
+            )
+
+    for ff_name in ("ff", "ff_context"):
+        ff = getattr(block, ff_name)
+        hidden_dim = ff.linear_out.in_features
+        if ff.linear_in.out_features != hidden_dim * 2:
+            raise ValueError(
+                f"Double block {block_idx}: {ff_name}.linear_in out_features {ff.linear_in.out_features} "
+                f"does not match SwiGLU 2x hidden dim {hidden_dim * 2}."
+            )
+        if ff.linear_out.out_features != ff.linear_in.in_features:
+            raise ValueError(
+                f"Double block {block_idx}: {ff_name}.linear_out out_features {ff.linear_out.out_features} "
+                f"does not match model dim {ff.linear_in.in_features}."
+            )
+
+
+def _validate_flux2_single_block(block, block_idx):
+    attn = block.attn
+    expected_inner_dim = attn.heads * attn.head_dim
+    if attn.inner_dim != expected_inner_dim:
+        raise ValueError(
+            f"Single block {block_idx}: inner_dim {attn.inner_dim} does not match heads * head_dim = {expected_inner_dim}."
+        )
+
+    expected_mlp_hidden_dim = int(attn.query_dim * attn.mlp_ratio)
+    if attn.mlp_hidden_dim != expected_mlp_hidden_dim:
+        raise ValueError(
+            f"Single block {block_idx}: mlp_hidden_dim {attn.mlp_hidden_dim} does not match query_dim * mlp_ratio = {expected_mlp_hidden_dim}."
+        )
+    if attn.mlp_mult_factor != 2:
+        raise ValueError(f"Single block {block_idx}: expected mlp_mult_factor 2, got {attn.mlp_mult_factor}.")
+
+    expected_qkv_mlp_shape = (3 * attn.inner_dim + attn.mlp_hidden_dim * attn.mlp_mult_factor, attn.query_dim)
+    expected_to_out_shape = (attn.out_dim, attn.inner_dim + attn.mlp_hidden_dim)
+    if tuple(attn.to_qkv_mlp_proj.weight.shape) != expected_qkv_mlp_shape:
+        raise ValueError(
+            f"Single block {block_idx}: to_qkv_mlp_proj weight shape {tuple(attn.to_qkv_mlp_proj.weight.shape)} "
+            f"does not match expected {expected_qkv_mlp_shape}."
+        )
+    if tuple(attn.to_out.weight.shape) != expected_to_out_shape:
+        raise ValueError(
+            f"Single block {block_idx}: to_out weight shape {tuple(attn.to_out.weight.shape)} does not match expected {expected_to_out_shape}."
+        )
+
+
+def validate_flux2_transformer_shapes(transformer_model, args):
+    for block_idx in range(args.double_minlayer, args.double_maxlayer):
+        _validate_flux2_double_block(transformer_model.transformer_blocks[block_idx], block_idx)
+
+    for block_idx in range(args.single_minlayer, args.single_maxlayer):
+        _validate_flux2_single_block(transformer_model.single_transformer_blocks[block_idx], block_idx)
+
+
 def _expand_swiglu_indices(pruned_idx, hidden_dim):
     expanded_idx = torch.cat([pruned_idx, pruned_idx + hidden_dim])
     return torch.sort(expanded_idx).values.tolist()
@@ -263,6 +338,7 @@ def prune_OBS_Diff_Structured_Flux2(args, pipe, dev, timestep_weight=None):
     dataloader = get_loaders(args.dataset, num_samples=args.num_samples, prompt_file=args.prompt_file)
     if len(dataloader) == 0:
         raise ValueError("Calibration prompts are empty. Check --dataset or --prompt_file.")
+    validate_flux2_transformer_shapes(pipe.transformer, args)
     target_pruned_modules = _collect_flux2_targets(args, pipe)
     modules_groups = group_flux2_modules_with_parallelism(target_pruned_modules, args.num_pruned_groups)
 
@@ -346,6 +422,7 @@ def prune_OBS_Diff_Structured_Flux2(args, pipe, dev, timestep_weight=None):
                     )
                     _apply_double_ffn_pruning(block, module_name, pruned_idx)
 
+                _validate_flux2_double_block(block, block_idx)
                 pruner_dict[block_key].free()
             else:
                 if block_idx in processed_single_blocks:
@@ -360,6 +437,7 @@ def prune_OBS_Diff_Structured_Flux2(args, pipe, dev, timestep_weight=None):
                     sparsity=sparsity,
                     percdamp=args.percdamp,
                 )
+                _validate_flux2_single_block(block, block_idx)
                 pruner_dict[block_key].free()
                 processed_single_blocks.add(block_idx)
 
