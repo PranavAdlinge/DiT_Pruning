@@ -15,7 +15,9 @@ class LossContext:
     Attributes:
         batch: dict with latents, text_embeds, text_ids, captions
         noise: Random noise used for flow-matching (same shape as model_input)
-        model_output: Student model prediction (unpacked latents)
+        model_output: Student model prediction (unpacked latents), if produced by the
+            training step. Custom regimens may leave this as None and perform their
+            own forward logic inside the loss.
         model_input: Patchified, normalized latents
         weighting: Per-element loss weight from sigma schedule
         packed_noisy: Packed noisy input for transformer forward
@@ -35,7 +37,7 @@ class LossContext:
     # --- Batch and tensors from forward pass ---
     batch: dict
     noise: torch.Tensor
-    model_output: torch.Tensor
+    model_output: torch.Tensor | None
     model_input: torch.Tensor
     weighting: torch.Tensor
     packed_noisy: torch.Tensor

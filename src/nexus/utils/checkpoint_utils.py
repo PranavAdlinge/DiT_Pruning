@@ -61,14 +61,18 @@ def make_klein_save_hook(
     """Return save hook for Klein DiT (LoRA or full)."""
 
     def save_hook(models, weights, output_dir):
-        trans = next((m for m in models if isinstance(unwrap_fn(m), trans_cls)), None)
-        if trans is None:
+        trans_idx = next(
+            (idx for idx, model in enumerate(models) if isinstance(unwrap_fn(model), trans_cls)),
+            None,
+        )
+        if trans_idx is None:
             raise ValueError(f"No {trans_cls} in save models")
         if not accelerator.is_main_process:
             return
+        trans = models[trans_idx]
         unwrapped = unwrap_fn(trans)
-        if weights:
-            weights.pop()
+        if weights and trans_idx < len(weights):
+            weights.pop(trans_idx)
         if train_mode == "lora":
             lora_sd = get_peft_model_state_dict(
                 unwrapped,
@@ -114,14 +118,13 @@ def make_klein_load_hook(
             if train_mode == "lora":
                 trans.add_adapter(lora_config)
         else:
-            trans = None
-            while models:
-                m = models.pop()
-                if isinstance(unwrap_fn(m), trans_cls):
-                    trans = unwrap_fn(m)
-                    break
-            if trans is None:
+            trans_idx = next(
+                (idx for idx, model in enumerate(models) if isinstance(unwrap_fn(model), trans_cls)),
+                None,
+            )
+            if trans_idx is None:
                 raise ValueError("No transformer in load hook")
+            trans = unwrap_fn(models.pop(trans_idx))
         if train_mode == "lora":
             lora_sd = pipeline_cls.lora_state_dict(input_dir)
             trans_sd = {

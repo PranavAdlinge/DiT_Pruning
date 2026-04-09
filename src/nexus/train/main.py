@@ -23,6 +23,7 @@ from pathlib import Path
 
 import diffusers
 import torch
+import torch.nn as nn
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -62,6 +63,63 @@ try:
 except ImportError:
     pass
 logger = get_logger(__name__)
+
+
+def _get_obj_attr(obj, name: str, default=None):
+    if hasattr(obj, name):
+        return getattr(obj, name)
+    module = getattr(obj, "module", None)
+    if module is not None and hasattr(module, name):
+        return getattr(module, name)
+    return default
+
+
+def _collect_trainable_params(*modules: nn.Module) -> list[torch.nn.Parameter]:
+    seen: set[int] = set()
+    params: list[torch.nn.Parameter] = []
+    for module in modules:
+        if module is None:
+            continue
+        for param in module.parameters():
+            if not param.requires_grad or id(param) in seen:
+                continue
+            seen.add(id(param))
+            params.append(param)
+    return params
+
+
+def _make_skip_transformer_checkpoint_hooks(accelerator: Accelerator, trans_cls: type, unwrap_fn):
+    """Skip saving/loading the frozen base transformer for loss-managed training."""
+
+    def save_hook(models, weights, output_dir):
+        custom_modules: list[nn.Module] = []
+
+        trans_idx = next(
+            (idx for idx, model in enumerate(models) if isinstance(unwrap_fn(model), trans_cls)),
+            None,
+        )
+
+        for idx, model in enumerate(models):
+            unwrapped = unwrap_fn(model)
+            if hasattr(unwrapped, "save_checkpoint_artifacts"):
+                custom_modules.append(unwrapped)
+
+        if trans_idx is not None and weights and trans_idx < len(weights):
+            weights.pop(trans_idx)
+
+        if accelerator.is_main_process:
+            for module in custom_modules:
+                module.save_checkpoint_artifacts(output_dir)
+
+    def load_hook(models, input_dir):
+        trans_idx = next(
+            (idx for idx, model in enumerate(models) if isinstance(unwrap_fn(model), trans_cls)),
+            None,
+        )
+        if trans_idx is not None:
+            models.pop(trans_idx)
+
+    return save_hook, load_hook
 
 
 def main(args=None):
@@ -176,9 +234,17 @@ def main(args=None):
         torch_dtype=weight_dtype,
     )
     transformer.requires_grad_(False)
+    transformer.to(device=accelerator.device, dtype=weight_dtype)
 
+    loss_cfg = cfg.loss
+    loss_fn = build_loss_fn(cfg, model_cfg=model_cfg, accelerator=accelerator, weight_dtype=weight_dtype)
+    if hasattr(loss_fn, "prepare_for_training"):
+        loss_fn.prepare_for_training(transformer)
+
+    train_base_model = bool(_get_obj_attr(loss_fn, "train_base_model", True))
+    checkpoint_train_mode = train_mode if train_base_model else None
     lora_config = None
-    if train_mode == "lora" and lora_cfg:
+    if train_base_model and train_mode == "lora" and lora_cfg:
         target_modules = (
             [m.strip() for m in lora_cfg.target_modules]
             if isinstance(lora_cfg.target_modules, list)
@@ -192,12 +258,17 @@ def main(args=None):
             target_modules=target_modules,
         )
         transformer.add_adapter(lora_config)
-    elif train_mode == "full":
+    elif train_base_model and train_mode == "full":
         transformer.requires_grad_(True)
+    elif not train_base_model and accelerator.is_main_process:
+        logger.info(
+            "Loss-managed training detected: top-level train_mode/lora config is ignored; "
+            "trainable student adapters should be configured under loss.kwargs."
+        )
 
-    pipeline_cls = pipeline_cfg._class if train_mode == "lora" else None
+    pipeline_cls = pipeline_cfg._class if checkpoint_train_mode == "lora" else None
 
-    if train_cfg.gradient_checkpointing:
+    if train_base_model and train_cfg.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
 
     os.makedirs(cfg.output_dir, exist_ok=True)
@@ -205,30 +276,32 @@ def main(args=None):
         dest = Path(cfg.output_dir) / "config.yaml"
         shutil.copy2(config_path, dest)
         logger.info("Config copied to %s", dest)
-    transformer.to(device=accelerator.device, dtype=weight_dtype)
 
     is_fsdp = getattr(accelerator.state, "fsdp_plugin", None) is not None
     unwrap = lambda m: unwrap_model(accelerator, m)
 
-    save_hook = make_klein_save_hook(
-        accelerator=accelerator,
-        trans_cls=trans_cls,
-        train_mode=train_mode,
-        pipeline_cls=pipeline_cls,
-        unwrap_fn=unwrap,
-        is_fsdp=is_fsdp,
-    )
-    load_hook = make_klein_load_hook(
-        accelerator=accelerator,
-        trans_cls=trans_cls,
-        pretrained_path=pretrained_path,
-        subfolder=subfolder,
-        train_mode=train_mode,
-        pipeline_cls=pipeline_cls,
-        lora_config=lora_config,
-        unwrap_fn=unwrap,
-        mixed_precision=mp,
-    )
+    if train_base_model:
+        save_hook = make_klein_save_hook(
+            accelerator=accelerator,
+            trans_cls=trans_cls,
+            train_mode=checkpoint_train_mode,
+            pipeline_cls=pipeline_cls,
+            unwrap_fn=unwrap,
+            is_fsdp=is_fsdp,
+        )
+        load_hook = make_klein_load_hook(
+            accelerator=accelerator,
+            trans_cls=trans_cls,
+            pretrained_path=pretrained_path,
+            subfolder=subfolder,
+            train_mode=checkpoint_train_mode,
+            pipeline_cls=pipeline_cls,
+            lora_config=lora_config,
+            unwrap_fn=unwrap,
+            mixed_precision=mp,
+        )
+    else:
+        save_hook, load_hook = _make_skip_transformer_checkpoint_hooks(accelerator, trans_cls, unwrap)
     accelerator.register_save_state_pre_hook(save_hook)
     accelerator.register_load_state_pre_hook(load_hook)
 
@@ -241,12 +314,23 @@ def main(args=None):
             train_cfg.gradient_accumulation_steps * train_cfg.batch_size * accelerator.num_processes
         )
 
+    loss_module = loss_fn if isinstance(loss_fn, nn.Module) else None
+
     if mp == "fp16":
         cast_training_params([transformer], dtype=torch.float32)
+        if loss_module is not None:
+            cast_training_params([loss_module], dtype=torch.float32)
 
     opt_cls = cfg.optimizer._class
     opt_kwargs = ns_to_kwargs(getattr(cfg.optimizer, "kwargs", None))
-    trainable_params = [p for p in transformer.parameters() if p.requires_grad]
+    trainable_params = _collect_trainable_params(
+        transformer if train_base_model else None,
+        loss_module,
+    )
+    if not trainable_params:
+        raise ValueError(
+            "No trainable parameters were found. Check train_mode and loss configuration."
+        )
     optimizer = opt_cls(
         trainable_params,
         lr=learning_rate,
@@ -296,8 +380,24 @@ def main(args=None):
         power=train_cfg.lr_power,
     )
 
-    transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        transformer, optimizer, train_dataloader, lr_scheduler
+    if loss_module is not None:
+        if train_base_model:
+            transformer, loss_module, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                transformer, loss_module, optimizer, train_dataloader, lr_scheduler
+            )
+        else:
+            loss_module, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                loss_module, optimizer, train_dataloader, lr_scheduler
+            )
+        loss_fn = loss_module
+    else:
+        transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            transformer, optimizer, train_dataloader, lr_scheduler
+        )
+
+    trainable_params = _collect_trainable_params(
+        transformer if train_base_model else None,
+        loss_fn if isinstance(loss_fn, nn.Module) else None,
     )
 
     len_dl_per_process = len(train_dataloader)
@@ -341,30 +441,37 @@ def main(args=None):
             context="training",
         )
 
-    # --- Loss & validation ---
-    loss_cfg = cfg.loss
-    loss_fn = build_loss_fn(cfg, model_cfg=model_cfg, accelerator=accelerator, weight_dtype=weight_dtype)
-
     if accelerator.is_main_process:
         logger.info("***** Running training *****")
         logger.info("  Data = %s", ds_kwargs.get("local"))
+        if not train_base_model:
+            logger.info(
+                "  Using loss-managed LoRA student blocks; base transformer remains frozen and is excluded from checkpoints."
+            )
 
     global_step = 0
     first_epoch = 0
 
     resume = getattr(cfg, "resume_from_checkpoint", None)
     if resume:
-        path = resume
-        if path == "latest":
+        resume_path = None
+        if resume == "latest":
             dirs = [d for d in os.listdir(cfg.output_dir) if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if dirs else None
+            if dirs:
+                resume_path = Path(cfg.output_dir) / dirs[-1]
         else:
-            path = os.path.basename(path)
-        if path:
-            accelerator.print(f"Resuming from {path}")
-            accelerator.load_state(os.path.join(cfg.output_dir, path))
-            global_step = int(path.split("-")[1])
+            candidate = Path(resume)
+            if candidate.exists():
+                resume_path = candidate
+            else:
+                candidate = Path(cfg.output_dir) / os.path.basename(str(resume))
+                if candidate.exists():
+                    resume_path = candidate
+        if resume_path is not None:
+            accelerator.print(f"Resuming from {resume_path}")
+            accelerator.load_state(str(resume_path))
+            global_step = int(resume_path.name.split("-")[1])
             first_epoch = global_step // num_updates_per_epoch
         else:
             resume = None
@@ -377,7 +484,12 @@ def main(args=None):
     )
 
     for _epoch in range(first_epoch, num_epochs):
-        transformer.train()
+        if train_base_model:
+            transformer.train()
+        else:
+            transformer.eval()
+        if loss_module is not None:
+            loss_fn.train()
         for _step, batch in enumerate(train_dataloader):
             batch = {
                 "latents": batch["latents"].to(accelerator.device, dtype=weight_dtype),
@@ -385,7 +497,11 @@ def main(args=None):
                 "text_ids": batch["text_ids"].to(accelerator.device),
             }
 
-            with accelerator.accumulate([transformer]):
+            accumulate_modules = [transformer] if train_base_model or loss_module is None else []
+            if loss_module is not None:
+                accumulate_modules.append(loss_fn)
+
+            with accelerator.accumulate(accumulate_modules):
                 loss, loss_breakdown = training_step_precomputed(
                     batch=batch,
                     transformer=transformer,
@@ -402,10 +518,7 @@ def main(args=None):
                 )
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
-                        transformer.parameters(),
-                        cfg.max_grad_norm,
-                    )
+                    accelerator.clip_grad_norm_(trainable_params, cfg.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -427,6 +540,7 @@ def main(args=None):
                 val_cfg = getattr(cfg, "validation", None)
                 if (
                     accelerator.is_main_process
+                    and _get_obj_attr(loss_fn, "supports_validation", True)
                     and val_cfg
                     and getattr(val_cfg, "prompt", None)
                     and global_step % getattr(val_cfg, "steps", 500) == 0
@@ -463,14 +577,20 @@ def main(args=None):
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
-        save_final_klein(
-            output_dir=Path(cfg.output_dir),
-            transformer=transformer,
-            train_mode=train_mode,
-            pipeline_cls=pipeline_cls,
-            unwrap_fn=unwrap,
-            logger=logger,
-        )
+        unwrapped_loss = unwrap(loss_fn) if isinstance(loss_fn, nn.Module) else loss_fn
+        if _get_obj_attr(unwrapped_loss, "save_transformer", True):
+            save_final_klein(
+                output_dir=Path(cfg.output_dir),
+                transformer=transformer,
+                train_mode=checkpoint_train_mode,
+                pipeline_cls=pipeline_cls,
+                unwrap_fn=unwrap,
+                logger=logger,
+            )
+        if hasattr(unwrapped_loss, "save_training_artifacts"):
+            artifact_paths = unwrapped_loss.save_training_artifacts(Path(cfg.output_dir))
+            if artifact_paths:
+                logger.info("Saved custom training artifacts to %s", ", ".join(str(p) for p in artifact_paths))
 
     accelerator.end_training()
 

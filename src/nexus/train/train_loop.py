@@ -17,6 +17,15 @@ from diffusers.training_utils import (
 from nexus.losses.context import LossContext
 
 
+def _get_loss_attr(loss_fn: Any, name: str, default: Any = None) -> Any:
+    if hasattr(loss_fn, name):
+        return getattr(loss_fn, name)
+    module = getattr(loss_fn, "module", None)
+    if module is not None and hasattr(module, name):
+        return getattr(module, name)
+    return default
+
+
 def get_sigmas(
     timesteps: torch.Tensor,
     noise_scheduler: Any,
@@ -94,17 +103,19 @@ def training_step_precomputed(
         else None
     )
 
-    model_pred = transformer(
-        hidden_states=packed_noisy,
-        timestep=timesteps / 1000,
-        guidance=guidance,
-        encoder_hidden_states=text_embeds,
-        txt_ids=text_ids,
-        img_ids=model_input_ids,
-        return_dict=False,
-    )[0]
-    model_pred = model_pred[:, : packed_noisy.size(1) :]
-    model_pred = Flux2KleinPipeline._unpack_latents_with_ids(model_pred, model_input_ids)
+    model_pred = None
+    if not _get_loss_attr(loss_fn, "manages_model_forward", False):
+        model_pred = transformer(
+            hidden_states=packed_noisy,
+            timestep=timesteps / 1000,
+            guidance=guidance,
+            encoder_hidden_states=text_embeds,
+            txt_ids=text_ids,
+            img_ids=model_input_ids,
+            return_dict=False,
+        )[0]
+        model_pred = model_pred[:, : packed_noisy.size(1) :]
+        model_pred = Flux2KleinPipeline._unpack_latents_with_ids(model_pred, model_input_ids)
 
     weighting = compute_loss_weighting_for_sd3(weighting_scheme=weighting_scheme, sigmas=sigmas)
 
